@@ -1,0 +1,35 @@
+sample:
+  name: Async scheduler (coroutine-first)
+common:
+  tags: lua_zephyr
+  integration_platforms:
+    - mps2/an385
+  harness: console
+  harness_config:
+    type: multi_line
+    ordered: true
+    regex:
+      - "loop start"
+      - "tasks spawned"
+      - "alpha round 1"
+      - "beta round 1"
+      - "gamma round 1"
+      - "alpha round 2"
+      - "beta round 2"
+      - "gamma round 2"
+      - "alpha round 3"
+      - "beta round 3"
+      - "alpha done"
+      - "gamma round 3"
+      - "beta done"
+      - "gamma done"
+      - "heap:\\s+\\d{4,5}\\s+\\d+\\s+\\d+\\s+\\d+%"
+      - "stack:\\s+\\d+\\s+\\d+\\s+\\d+\\s+\\d+%"
+tests:
+  sample.lua_zephyr.async: {}
+  sample.lua_zephyr.async.precompile_only:
+    extra_args:
+      - ASYNC_BYTECODE=1
+    extra_configs:
+      - CONFIG_LUA_PRECOMPILE=y
+      - CONFIG_LUA_PRECOMPILE_ONLY=y
