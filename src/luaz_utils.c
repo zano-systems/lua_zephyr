@@ -15,6 +15,7 @@
 #include <luaz_zbus.h>
 #endif
 #include <sys/times.h>
+#include <sys/types.h>
 #include <time.h>
 #include <zephyr/sys/sys_heap.h>
 #include <zephyr/logging/log.h>
@@ -319,6 +320,53 @@ int _unlink(const char *pathname)
 /** @brief POSIX stub — _link is unused but required by the toolchain. */
 int _link(const char *oldpath, const char *newpath)
 {
+	errno = ENOSYS;
+	return -1;
+}
+
+/*
+ * The base library's loadfile reaches picolibc's fopen, which needs these to
+ * link. Weak, so a real POSIX file layer overrides them.
+ */
+
+__weak int open(const char *path, int flags, ...)
+{
+	ARG_UNUSED(path);
+	ARG_UNUSED(flags);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak int close(int fd)
+{
+	ARG_UNUSED(fd);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak ssize_t read(int fd, void *buf, size_t count)
+{
+	ARG_UNUSED(fd);
+	ARG_UNUSED(buf);
+	ARG_UNUSED(count);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak ssize_t write(int fd, const void *buf, size_t count)
+{
+	ARG_UNUSED(fd);
+	ARG_UNUSED(buf);
+	ARG_UNUSED(count);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak off_t lseek(int fd, off_t offset, int whence)
+{
+	ARG_UNUSED(fd);
+	ARG_UNUSED(offset);
+	ARG_UNUSED(whence);
 	errno = ENOSYS;
 	return -1;
 }
