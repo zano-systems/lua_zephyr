@@ -24,16 +24,43 @@
 set(_LUAZ_KCONFIG_DIR "${CMAKE_BINARY_DIR}/Kconfig")
 file(MAKE_DIRECTORY "${_LUAZ_KCONFIG_DIR}")
 
+# _luaz_write_thread_kconfig(NAME [ASYNC])
+#
+# With ASYNC the thread always runs under the scheduler (no prompt).
 macro(_luaz_write_thread_kconfig _name)
     string(TOUPPER "${_name}" _name_upper)
     set(_kconfig_file "${_LUAZ_KCONFIG_DIR}/Kconfig.lua_thread.${_name}")
 
+    if("${ARGN}" STREQUAL "ASYNC")
+        set(_async_kconfig
+"config ${_name_upper}_LUA_THREAD_ASYNC\n\
+    def_bool LUA_ASYNC\n")
+    else()
+        set(_async_kconfig
+"config ${_name_upper}_LUA_THREAD_ASYNC\n\
+    bool \"${_name} runs under the async scheduler\"\n\
+    depends on LUA_ASYNC\n\
+    help\n\
+      Run the ${_name} script under the zephyr.async scheduler.\n")
+    endif()
+
     file(WRITE "${_kconfig_file}"
-"config ${_name_upper}_LUA_THREAD_STACK_SIZE\n\
+"${_async_kconfig}\
+\n\
+config ${_name_upper}_LUA_THREAD_STACK_SIZE\n\
     int \"${_name} Lua thread stack size\"\n\
+    default LUA_ASYNC_THREAD_STACK_SIZE if ${_name_upper}_LUA_THREAD_ASYNC\n\
     default LUA_THREAD_STACK_SIZE\n\
     help\n\
       Stack size for the ${_name} Lua thread.\n\
+\n\
+config ${_name_upper}_LUA_ASYNC_MAX_READERS\n\
+    int \"${_name} awaited (task, channel) pairs\"\n\
+    depends on ${_name_upper}_LUA_THREAD_ASYNC\n\
+    range 0 8192\n\
+    default LUA_ASYNC_MAX_READERS\n\
+    help\n\
+      Readers in the ${_name} thread's slab; 0 means min(2 x tasks, tasks x channels).\n\
 \n\
 config ${_name_upper}_LUA_THREAD_HEAP_SIZE\n\
     int \"${_name} Lua thread heap size\"\n\
@@ -84,6 +111,28 @@ macro(luaz_define_fs_thread _path)
     cmake_path(REMOVE_EXTENSION _lua_fname OUTPUT_VARIABLE _lua_fname)
     _luaz_write_thread_kconfig("${_lua_fname}")
 endmacro()
+
+# luaz_define_async_thread(NAME SOURCE|BYTECODE|FS FILE...)
+#
+# Define an async Lua thread NAME whose files all run as tasks in one
+# scheduler, in the order given. SOURCE embeds the files, BYTECODE embeds
+# them precompiled (CONFIG_LUA_PRECOMPILE), FS loads them from these
+# filesystem paths at runtime (CONFIG_LUA_FS). Requires CONFIG_LUA_ASYNC.
+function(luaz_define_async_thread _name _mode)
+    if(NOT "${_mode}" MATCHES "^(SOURCE|BYTECODE|FS)$")
+        message(FATAL_ERROR
+            "luaz_define_async_thread(${_name}): mode must be SOURCE, BYTECODE or FS, "
+            "got '${_mode}'")
+    endif()
+    if(ARGC LESS 3)
+        message(FATAL_ERROR "luaz_define_async_thread(${_name}): no files given")
+    endif()
+    list(APPEND LUAZ_ASYNC_THREADS "${_name}")
+    set(LUAZ_ASYNC_THREADS "${LUAZ_ASYNC_THREADS}" PARENT_SCOPE)
+    set(LUAZ_ASYNC_THREAD_${_name}_MODE "${_mode}" PARENT_SCOPE)
+    set(LUAZ_ASYNC_THREAD_${_name}_FILES "${ARGN}" PARENT_SCOPE)
+    _luaz_write_thread_kconfig("${_name}" ASYNC)
+endfunction()
 
 # ===========================================================================
 # Section 2: Post-Zephyr — host luac build, code generation, thread creation
@@ -356,10 +405,111 @@ function(luaz_add_fs_file SOURCE_PATH)
 endfunction()
 
 
+# luaz_add_async_thread(NAME)
+#
+# Generate the thread defined by luaz_define_async_thread(NAME ...).
+# Embedded files get thread-prefixed C symbols (<NAME>_<file>_lua_script or
+# _lua_bytecode), so the same file name can be used by several threads.
+function(_luaz_c_string_escape _str _out)
+    string(REPLACE "\\" "\\\\" _str "${_str}")
+    string(REPLACE "\"" "\\\"" _str "${_str}")
+    set(${_out} "${_str}" PARENT_SCOPE)
+endfunction()
+
+function(luaz_add_async_thread _name)
+    set(NAME "${_name}")
+    string(TOUPPER "${_name}" NAME_UPPER)
+    set(LUAZ_MODE "${LUAZ_ASYNC_THREAD_${_name}_MODE}")
+    set(_files ${LUAZ_ASYNC_THREAD_${_name}_FILES})
+    list(LENGTH _files LUAZ_COUNT)
+
+    if(LUAZ_MODE STREQUAL "BYTECODE" AND NOT CONFIG_LUA_PRECOMPILE)
+        message(FATAL_ERROR
+            "luaz_define_async_thread(${_name} BYTECODE ...) requires CONFIG_LUA_PRECOMPILE=y.")
+    endif()
+    if(LUAZ_MODE STREQUAL "FS" AND NOT CONFIG_LUA_FS)
+        message(FATAL_ERROR
+            "luaz_define_async_thread(${_name} FS ...) requires CONFIG_LUA_FS=y.")
+    endif()
+
+    set(_out_dir "${CMAKE_CURRENT_BINARY_DIR}/lua")
+    set(LUAZ_INCLUDES "")
+    set(LUAZ_LOADS "")
+    set(_headers "")
+
+    foreach(_file ${_files})
+        if(LUAZ_MODE STREQUAL "FS")
+            _luaz_c_string_escape("${_file}" _path)
+            string(APPEND LUAZ_LOADS "\tn += load(L, \"${_path}\");\n")
+            continue()
+        endif()
+
+        cmake_path(ABSOLUTE_PATH _file BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            NORMALIZE OUTPUT_VARIABLE _src)
+        cmake_path(GET _file FILENAME _base)
+        _luaz_c_string_escape("${_base}" _chunk)
+
+        cmake_path(IS_PREFIX CMAKE_CURRENT_SOURCE_DIR "${_src}" NORMALIZE _in_src)
+        cmake_path(IS_PREFIX CMAKE_CURRENT_BINARY_DIR "${_src}" NORMALIZE _in_bin)
+        if(_in_src)
+            cmake_path(RELATIVE_PATH _src BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                OUTPUT_VARIABLE _rel)
+        elseif(_in_bin)
+            cmake_path(RELATIVE_PATH _src BASE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+                OUTPUT_VARIABLE _rel)
+        else()
+            set(_rel "${_base}")
+        endif()
+        cmake_path(REMOVE_EXTENSION _rel LAST_ONLY)
+        string(MAKE_C_IDENTIFIER "${_name}_${_rel}" _sym)
+        if(DEFINED _luaz_owner_${_sym})
+            message(FATAL_ERROR
+                "luaz_define_async_thread(${_name}): '${_luaz_owner_${_sym}}' and '${_file}' "
+                "both map to the symbol '${_sym}'; rename one of them.")
+        endif()
+        set(_luaz_owner_${_sym} "${_file}")
+
+        if(LUAZ_MODE STREQUAL "SOURCE")
+            set(_header "${_out_dir}/${_sym}_lua_script.h")
+            set(_template "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/templates/lua_template.h.in")
+            set(_gen_mode source)
+            set(_buf "${_sym}_lua_script, sizeof(${_sym}_lua_script) - 1")
+        else()
+            set(_header "${_out_dir}/${_sym}_lua_bytecode.h")
+            set(_template "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/templates/lua_bytecode_template.h.in")
+            set(_gen_mode bytecode --luac "${LUAC_HOST}")
+            set(_buf "(const char *)${_sym}_lua_bytecode, ${_sym}_lua_bytecode_len")
+        endif()
+
+        add_custom_command(
+            OUTPUT "${_header}"
+            COMMAND ${PYTHON_EXECUTABLE} "${LUA_GENERATE_SCRIPT}"
+                --mode ${_gen_mode}
+                --template "${_template}"
+                --output "${_header}"
+                --name "${_sym}"
+                "${_src}"
+            DEPENDS "${_src}" "${_template}"
+            COMMENT "Embedding ${_file} in async thread ${_name}"
+        )
+        list(APPEND _headers "${_header}")
+        cmake_path(GET _header FILENAME _header_name)
+        string(APPEND LUAZ_INCLUDES "#include \"${_header_name}\"\n")
+        string(APPEND LUAZ_LOADS "\tn += load(L, ${_buf}, \"@${_chunk}\");\n")
+    endforeach()
+
+    set(_out "${_out_dir}/${_name}_lua_async_thread.c")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/templates/lua_async_thread.c.in"
+        "${_out}" @ONLY)
+
+    include_directories("${_out_dir}")
+    target_sources(app PRIVATE "${_out}" ${_headers})
+endfunction()
+
 # luaz_generate_threads()
 #
 # Generate Lua threads from the LUAZ_SOURCE_THREADS, LUAZ_BYTECODE_THREADS,
-# and LUAZ_FS_THREADS list variables. Each entry is processed by the
+# LUAZ_FS_THREADS and LUAZ_ASYNC_THREADS list variables. Each entry is processed by the
 # corresponding luaz_add_*_thread() function.
 function(luaz_generate_threads)
     foreach(_path ${LUAZ_SOURCE_THREADS})
@@ -370,5 +520,8 @@ function(luaz_generate_threads)
     endforeach()
     foreach(_path ${LUAZ_FS_THREADS})
         luaz_add_fs_thread("${_path}")
+    endforeach()
+    foreach(_name ${LUAZ_ASYNC_THREADS})
+        luaz_add_async_thread("${_name}")
     endforeach()
 endfunction()

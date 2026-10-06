@@ -54,4 +54,6 @@ if(CONFIG_LUA)
 
     # Add the helper functions to be used inside the user CMakeLists.txt.
     include("${LUA_DIR}/luaz.cmake")
+
+    zephyr_library_sources_ifdef(CONFIG_LUA_ASYNC "${SRC_DIR}/luaz_async.c")
 endif()

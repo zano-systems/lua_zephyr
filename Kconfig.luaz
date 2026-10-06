@@ -130,6 +130,81 @@ config LUA_EXTRA_OPTIMIZATIONS
       Saves ~636 bytes per lua_newstate on 32-bit targets by reducing
       the string table initial size (128->64) and string cache (53x2->11x1).
 
+config LUA_ASYNC
+    bool "Cooperative async scheduler (zephyr.async)"
+    select ZBUS_RUNTIME_OBSERVERS
+    select POLL
+    help
+      The zephyr.async library: cooperative tasks (spawn, sleep, yield,
+      join, cancel) and chan:await. Enable it per thread with
+      CONFIG_<NAME>_LUA_THREAD_ASYNC; the script body becomes the first
+      task.
+
+if LUA_ASYNC
+
+config LUA_ASYNC_MAX_TASKS
+    int "Maximum live tasks per async thread (including task-0)"
+    range 1 256
+    default 8
+    help
+      Each task slot costs 40 bytes of scheduler state on 32-bit targets,
+      plus the task's coroutine while it is live.
+
+config LUA_ASYNC_MAX_CHANNELS
+    int "Maximum channels one async thread can await"
+    range 1 256
+    default 8
+    help
+      Each channel record costs 24 bytes of scheduler state on 32-bit
+      targets. Each awaited channel also uses one zbus runtime observer
+      node: from the kernel heap with ZBUS_RUNTIME_OBSERVERS_NODE_ALLOC_DYNAMIC
+      (the default), or from CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_POOL_SIZE
+      with ZBUS_RUNTIME_OBSERVERS_NODE_ALLOC_STATIC.
+
+config LUA_ASYNC_MAX_READERS
+    int "Default awaited (task, channel) pairs per async thread"
+    range 0 8192
+    default 0
+    help
+      A task holds one reader per channel it has awaited, until it ends.
+      Readers come from a per-thread k_mem_slab of 16-byte blocks (24 on
+      64-bit targets); await raises when it is empty. 0 means
+      2 x LUA_ASYNC_MAX_TASKS, capped at LUA_ASYNC_MAX_TASKS x
+      LUA_ASYNC_MAX_CHANNELS (every possible pair). Per-thread override:
+      CONFIG_<NAME>_LUA_ASYNC_MAX_READERS.
+
+config LUA_ASYNC_MAX_LOCK_WAITS
+    int "Channel locks the idle scheduler waits on at once"
+    range 1 32
+    default 4
+    help
+      While idle, the scheduler sleeps on its subscriber and on the locks
+      that pub_async/read_async calls wait for, one k_poll event each
+      (about 20 bytes of stack). With more distinct locks than this, it
+      wakes every tick to recheck them.
+
+config LUA_ASYNC_CHAN_QUEUE_DEPTH
+    int "Default broadcast ring depth per awaited channel"
+    range 1 1024
+    default 4
+    help
+      Recent messages kept per awaited channel. A task that falls further
+      behind loses the oldest ones (see chan:dropped()). Override with
+      chan:queue_depth(n).
+
+config LUA_ASYNC_MAX_DRAIN
+    int "Maximum messages taken from zbus per scheduler pass"
+    range 1 1024
+    default 16
+
+config LUA_ASYNC_THREAD_STACK_SIZE
+    int "Default stack size for async Lua threads"
+    default 4096
+    help
+      Default stack size of threads with CONFIG_<NAME>_LUA_THREAD_ASYNC=y.
+
+endif # LUA_ASYNC
+
 config LUA_FS
     bool "Lua filesystem support"
     depends on FILE_SYSTEM
