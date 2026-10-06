@@ -24,6 +24,10 @@
 #include <luaz_fs.h>
 #endif
 
+#ifdef CONFIG_LUA_ASYNC
+#include <luaz_async.h>
+#endif
+
 LOG_MODULE_REGISTER(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
 
 /**
@@ -100,6 +104,12 @@ static int k_msleep_wrapper(lua_State *L)
 	}
 
 	int ms = luaL_checkinteger(L, 1);
+
+	luaL_argcheck(L, ms >= 0, 1, "ms must be >= 0");
+
+#ifdef CONFIG_LUA_ASYNC
+	luaz_async_warn_blocking(L, "zephyr.msleep");
+#endif
 
 	k_msleep(ms);
 
@@ -191,10 +201,39 @@ static const luaL_Reg zephyr_wrappers[] = {
 	{NULL, NULL} /* Sentinel value to mark the end of the array */
 };
 
+k_timeout_t luaz_check_timeout(lua_State *L, int idx)
+{
+	lua_Integer ms = luaL_checkinteger(L, idx);
+
+	if (ms == SYS_FOREVER_MS) {
+		return K_FOREVER;
+	}
+	luaL_argcheck(L, ms >= 0, idx, "timeout must be zephyr.K_FOREVER, zephyr.K_NO_WAIT or ms");
+
+	return ms == 0 ? K_NO_WAIT : K_MSEC(ms);
+}
+
+/* Timeouts, and the errno values (positive, as in C) that bindings return negated. */
+static const struct {
+	const char *name;
+	int value;
+} zephyr_constants[] = {
+	{"K_NO_WAIT", 0},         {"K_FOREVER", SYS_FOREVER_MS},
+	{"EAGAIN", EAGAIN},       {"EBUSY", EBUSY},
+	{"ECANCELED", ECANCELED}, {"EFAULT", EFAULT},
+	{"EILSEQ", EILSEQ},       {"EINVAL", EINVAL},
+	{"ENOMEM", ENOMEM},       {"ENOMSG", ENOMSG},
+};
+
 /** @brief Open the `zephyr` Lua library. Registers kernel wrappers and nests zbus/fs. */
 int luaopen_zephyr(lua_State *L)
 {
 	luaL_newlib(L, zephyr_wrappers);
+
+	for (size_t i = 0; i < ARRAY_SIZE(zephyr_constants); i++) {
+		lua_pushinteger(L, zephyr_constants[i].value);
+		lua_setfield(L, -2, zephyr_constants[i].name);
+	}
 
 #ifdef CONFIG_LUA_LIB_ZBUS
 	/* Nest zbus as zephyr.zbus */

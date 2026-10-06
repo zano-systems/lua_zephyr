@@ -91,6 +91,16 @@ void *lua_zephyr_allocator(void *ud, void *ptr, size_t osize, size_t nsize);
 int luaopen_zephyr(lua_State *L);
 
 /**
+ * @brief Check a Lua timeout argument and convert it.
+ *
+ * @param L    Lua state.
+ * @param idx  Stack index of the timeout: zephyr.K_FOREVER (-1),
+ *             zephyr.K_NO_WAIT (0) or a positive number of milliseconds.
+ * @return The matching k_timeout_t; raises a Lua error for anything else.
+ */
+k_timeout_t luaz_check_timeout(lua_State *L, int idx);
+
+/**
  * @brief Register minimal require() and preload zephyr + standard Lua libs.
  *
  * Call once after lua_newstate() to make require() available.
