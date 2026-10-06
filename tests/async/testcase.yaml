@@ -1,0 +1,50 @@
+common:
+  tags: lua_zephyr
+  platform_allow: native_sim
+  integration_platforms:
+    - native_sim
+  harness: console
+tests:
+  lua_zephyr.async:
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 65 passed, 0 failed, 7 skipped"
+  lua_zephyr.async.limits:
+    extra_configs:
+      - CONFIG_LUA_ASYNC_MAX_CHANNELS=2
+      - CONFIG_LUA_ASYNC_MAX_DRAIN=2
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 3 passed, 0 failed, 69 skipped"
+  lua_zephyr.async.watch_fail:
+    extra_configs:
+      - CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_ALLOC_STATIC=y
+      - CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_POOL_SIZE=1
+      - CONFIG_ZBUS_ASSERT_MOCK=y
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 3 passed, 0 failed, 69 skipped"
+  lua_zephyr.async.readers:
+    extra_configs:
+      - CONFIG_LUA_ASYNC_MAX_READERS=2
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 2 passed, 0 failed, 70 skipped"
+  lua_zephyr.async.many:
+    extra_configs:
+      - CONFIG_LUA_ASYNC_MAX_TASKS=64
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 2 passed, 0 failed, 70 skipped"
+  lua_zephyr.async.lock_waits:
+    extra_configs:
+      - CONFIG_LUA_ASYNC_MAX_LOCK_WAITS=1
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 2 passed, 0 failed, 70 skipped"

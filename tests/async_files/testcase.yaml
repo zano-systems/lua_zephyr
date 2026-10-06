@@ -1,0 +1,15 @@
+common:
+  tags: lua_zephyr
+  platform_allow: native_sim
+  integration_platforms:
+    - native_sim
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "all 40 tasks ran"
+tests:
+  # Lua API checks turn an overflow of the caller's stack into an assertion.
+  lua_zephyr.async_files.max_tasks:
+    extra_args:
+      - EXTRA_CFLAGS=-DLUA_USE_APICHECK
