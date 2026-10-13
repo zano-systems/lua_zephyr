@@ -30,6 +30,7 @@ def lua_to_c_string(path):
 
     strings = ["\\\n"]
     for line in script.splitlines():
+        line = line.replace("\\", "\\\\")
         line = line.replace('"', '\\"')
         line = line.replace("\r", "")
         strings.append(line + "\\n")
