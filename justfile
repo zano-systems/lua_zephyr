@@ -26,6 +26,15 @@ c_board := "-b " + board
 
 project_dir := 'app'
 
+# ── Workspace ────────────────────────────────────────────────────────────────────
+
+# Create/update the minimal nested west workspace from the tracked manifest
+workspace:
+    mkdir -p ws/manifest
+    ln -sfn ../../west.yml ws/manifest/west.yml
+    if [ ! -d ws/.west ]; then west init -l ws/manifest; fi
+    cd ws && west update --narrow --fetch-opt=--depth=1
+
 # ── Build ────────────────────────────────────────────────────────────────────────
 
 # Full configure + build
