@@ -49,6 +49,68 @@ destabilises the system.
 - A [Zephyr workspace](https://docs.zephyrproject.org/latest/develop/getting_started/index.html) (west, SDK, toolchain)
 - [`just`](https://github.com/casey/just) command runner (optional but recommended)
 
+### Optional: create a local workspace
+
+Instead of using an existing Zephyr workspace, run this from the repository root
+with `west` installed and available in your active Python environment:
+
+```sh
+just workspace
+```
+
+Without `just`, the equivalent commands are:
+
+```sh
+mkdir -p ws/manifest
+ln -sfn ../../west.yml ws/manifest/west.yml
+if [ ! -d ws/.west ]; then west init -l ws/manifest; fi
+(cd ws && west update --narrow --fetch-opt=--depth=1)
+```
+
+This creates a Git-ignored `ws/` workspace containing Zephyr **v4.4.2** and only
+three imported modules: `cmsis_6` for the default `mps2/an385` Cortex-M board,
+`littlefs` for the filesystem sample, and `nanopb` for the producer/consumer
+sample. Other boards or features may need additional modules in `west.yml`'s
+allowlist. Downloads use shallow Git history.
+
+The tracked `west.yml` is symlinked from `ws/manifest/`, so there is only one
+manifest to edit. This keeps `.west/` inside `ws/`: `west init -l` creates it
+next to the manifest directory, not inside it. Run `just workspace` again
+after changing the manifest to update the dependencies.
+
+Install Python dependencies through west in your active virtual environment.
+This module's Python helpers use only the standard library, so no additional
+requirements are needed. Zephyr and nanopb declare their own requirements,
+which `west packages pip` discovers automatically. From the repository root:
+
+```sh
+(cd ws && west packages pip --install)
+```
+
+Run west commands inside `ws/` (or a subdirectory) so west can discover the
+workspace and Zephyr without environment-variable overrides. The sample
+applications register this Lua module in their `CMakeLists.txt`.
+
+A compatible Zephyr SDK/toolchain is still required; the manifest does not
+install it. This repository is outside the nested workspace and is not a
+west-managed project, so west's project-level `submodules: true` option cannot
+initialize its Lua submodule. Initialize it if needed:
+
+```sh
+git submodule update --init
+```
+
+For example, build and run a sample from inside the workspace:
+
+```sh
+cd ws
+west build -b mps2/an385 ../samples/hello_world
+west build -t run
+```
+
+This uses `ws/build/` for build output; the sample sources stay outside the
+workspace.
+
 ### 1. Add the module
 
 Clone (or add as a west module) next to your Zephyr workspace, then point your
