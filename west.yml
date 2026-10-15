@@ -1,0 +1,14 @@
+# Minimal workspace for mps2/an385 and the repository's samples.
+manifest:
+  projects:
+    - name: zephyr
+      url: https://github.com/zephyrproject-rtos/zephyr
+      revision: v4.4.2
+      clone-depth: 1
+      import:
+        name-allowlist:
+          - cmsis_6 # Cortex-M support for mps2/an385
+          - littlefs # Filesystem sample
+          - nanopb # Producer/consumer sample
+  self:
+    path: manifest
