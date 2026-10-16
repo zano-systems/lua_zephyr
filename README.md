@@ -438,4 +438,6 @@ that default to the global values above.
 
 ## License
 
-Apache-2.0
+Copyright 2026 Rodrigo Peixoto and Victor Miranda.
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
