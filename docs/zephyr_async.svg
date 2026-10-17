@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1340 760" width="1340" height="760" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="One Lua app thread runs three tasks under the zephyr.async scheduler, which receives zbus messages through one subscriber; Task 3 publishes with pub_async to a channel a C app consumes.">
+  <defs>
+    <marker id="h" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5d7a85"/></marker>
+  </defs>
+  <rect x="170" y="10" width="830" height="300" rx="16" fill="#12116b"/>
+  <text x="200" y="58" text-anchor="start" font-size="30" font-weight="700" fill="#ffffff">Lua App · one thread</text>
+  <rect x="200" y="88" width="230" height="110" rx="10" fill="#2d2ca8"/>
+  <text x="315" y="133" text-anchor="middle" font-size="26" font-weight="700" fill="#ffffff">Task 1</text>
+  <text x="315" y="168" text-anchor="middle" font-size="19" fill="#cfd0ff">await(Input S1)</text>
+  <rect x="460" y="88" width="230" height="110" rx="10" fill="#2d2ca8"/>
+  <text x="575" y="133" text-anchor="middle" font-size="26" font-weight="700" fill="#ffffff">Task 2</text>
+  <text x="575" y="168" text-anchor="middle" font-size="19" fill="#cfd0ff">await(Input S2)</text>
+  <rect x="720" y="88" width="230" height="110" rx="10" fill="#2d2ca8"/>
+  <text x="835" y="133" text-anchor="middle" font-size="26" font-weight="700" fill="#ffffff">Task 3</text>
+  <text x="835" y="168" text-anchor="middle" font-size="19" fill="#cfd0ff">pub_async(Output S1)</text>
+  <rect x="200" y="222" width="490" height="60" rx="10" fill="#4a49cf"/>
+  <text x="445" y="260" text-anchor="middle" font-size="21" font-weight="700" fill="#ffffff">zephyr.async scheduler · one subscriber</text>
+  <rect x="1040" y="10" width="260" height="300" rx="16" fill="#b3b3b3"/>
+  <text x="1170" y="170" text-anchor="middle" font-size="30" font-weight="700" fill="#ffffff">C App</text>
+  <rect x="0" y="330" width="1340" height="140" rx="12" fill="#6b2fd5"/>
+  <text x="26" y="417" text-anchor="start" font-size="46" font-weight="700" fill="#ffffff">ZBUS</text>
+  <rect x="240" y="359" width="150" height="82" rx="6" fill="#3a8aef"/>
+  <text x="315" y="408" text-anchor="middle" font-size="21" font-weight="700" fill="#ffffff">Input S1</text>
+  <rect x="500" y="359" width="150" height="82" rx="6" fill="#3a8aef"/>
+  <text x="575" y="408" text-anchor="middle" font-size="21" font-weight="700" fill="#ffffff">Input S2</text>
+  <rect x="1095" y="359" width="150" height="82" rx="6" fill="#3a8aef"/>
+  <text x="1170" y="408" text-anchor="middle" font-size="21" font-weight="700" fill="#ffffff">Output S1</text>
+  <rect x="195" y="525" width="240" height="205" rx="10" fill="#e6e6e6"/>
+  <text x="315" y="585" text-anchor="middle" font-size="24" font-weight="700" fill="#222222">Service 1</text>
+  <text x="315" y="647" text-anchor="middle" font-size="21" fill="#222222">Hardware</text>
+  <text x="315" y="677" text-anchor="middle" font-size="21" fill="#222222">dependent code</text>
+  <rect x="455" y="525" width="240" height="205" rx="10" fill="#e6e6e6"/>
+  <text x="575" y="585" text-anchor="middle" font-size="24" font-weight="700" fill="#222222">Service 2</text>
+  <text x="575" y="647" text-anchor="middle" font-size="21" fill="#222222">Hardware</text>
+  <text x="575" y="677" text-anchor="middle" font-size="21" fill="#222222">dependent code</text>
+  <path d="M315,523 V447" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+  <path d="M575,523 V447" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+  <path d="M315,357 V288" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+  <path d="M575,357 V288" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+  <path d="M315,220 V204" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+  <path d="M575,220 V204" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+  <path d="M835,200 V318 H1135 V353" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+  <path d="M1205,357 V316" fill="none" stroke="#5d7a85" stroke-width="4" marker-end="url(#h)"/>
+</svg>

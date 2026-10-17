@@ -1,0 +1,19 @@
+sample:
+  name: Async scheduler with zbus
+common:
+  tags: lua_zephyr
+  integration_platforms:
+    - mps2/an385
+  harness: console
+tests:
+  sample.lua_zephyr.async_zbus:
+    harness_config:
+      type: multi_line
+      ordered: false
+      regex:
+        - "plain require ok=false"
+        - "raw false .*channel 'chan_raw' has no message descriptor"
+        - "idle nil EAGAIN"
+        - "zephyr.msleep blocks every async task"
+        - "fast got 12 dropped 0"
+        - "slow first 1 later 8 dropped 3"

@@ -78,6 +78,11 @@ test:
     rm -rf /tmp/lua_tests
     west twister -p mps2/an385 -T samples -O /tmp/lua_tests
 
+# Run the async scheduler tests on native_sim
+test-native:
+    rm -rf /tmp/lua_tests_native
+    west twister -p native_sim -T tests -O /tmp/lua_tests_native
+
 # Run test suite on a physical device
 test-device sample="":
     rm -rf /tmp/lua_tests

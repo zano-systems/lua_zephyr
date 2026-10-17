@@ -26,6 +26,7 @@ destabilises the system.
 **System integration:**
 
 - **zbus bindings** — publish, read, and subscribe to channels directly from Lua
+- **Async tasks** — many cooperative tasks in one Lua thread (`zephyr.async`)
 - **Message descriptors** — automatic Lua table ↔ C struct conversion (manual or nanopb-generated)
 - **Kernel API** — `msleep`, `printk`, structured logging (`log_inf`, `log_wrn`, `log_dbg`, `log_err`)
 - **Interactive REPL** — Lua shell over the Zephyr console
@@ -197,6 +198,9 @@ Every sample includes a `sample.yaml` for automated testing with
 | [`producer_consumer`](samples/producer_consumer)       | zbus pub/sub between Lua and C           | nanopb descriptors, nested structs, bytecode                |
 | [`littlefs`](samples/littlefs)                         | Scripts loaded from LittleFS at runtime  | `luaz_define_fs_thread`, `luaz_add_fs_file`, `zephyr.fs`    |
 | [`heavy`](samples/heavy)                               | Stress test with dynamic code generation | Heap usage tracking, recursion, string ops                  |
+| [`async`](samples/async)                               | Three tasks in one thread                | `zephyr.async`, spawn/sleep, bytecode-only variant          |
+| [`async_zbus`](samples/async_zbus)                     | Tasks awaiting a C publisher             | `chan:await`, broadcast ring, drops, timeouts               |
+| [`async_files`](samples/async_files)                   | 16 tasks from 16 files, one thread       | `luaz_define_async_thread`, bytecode-only variant           |
 
 ```sh
 # Run a single sample
@@ -205,6 +209,9 @@ just run
 
 # Run the full test suite
 just test           # west twister -p mps2/an385 -T samples
+
+# Run the async scheduler tests on native_sim
+just test-native    # west twister -p native_sim -T tests
 ```
 
 ## How It Works
@@ -214,7 +221,8 @@ just test           # west twister -p mps2/an385 -T samples
 Each generated thread is a self-contained Zephyr thread with:
 
 - A dedicated **sys_heap** (`CONFIG_LUA_THREAD_HEAP_SIZE`, default 32 KB)
-- A dedicated **thread stack** (`CONFIG_LUA_THREAD_STACK_SIZE`, default 2 KB)
+- A dedicated **thread stack** (`CONFIG_LUA_THREAD_STACK_SIZE`, default 2 KB;
+  async threads default to `CONFIG_LUA_ASYNC_THREAD_STACK_SIZE`, 4 KB)
 - A custom **Lua allocator** backed by that heap
 - **`luaz_openlibs()`** called automatically — registers `require()` and preloads all Kconfig-enabled libraries
 - A weak **setup hook** (`<script>_lua_setup`) for registering zbus channels/observers
@@ -223,13 +231,14 @@ Per-thread Kconfig overrides are generated automatically:
 `CONFIG_<SCRIPT>_LUA_THREAD_STACK_SIZE`, `_HEAP_SIZE`, and `_PRIORITY` default
 to the global values but can be tuned individually.
 
-There are three thread flavours:
+There are three thread flavours, plus multi-file async threads:
 
 | Variant        | CMake macro                   | Script location                      |
 | -------------- | ----------------------------- | ------------------------------------ |
 | **Source**     | `luaz_define_source_thread`   | Embedded as C string, parsed at boot |
 | **Bytecode**   | `luaz_define_bytecode_thread` | Precompiled, parser can be stripped  |
 | **Filesystem** | `luaz_define_fs_thread`       | Loaded from FS path at runtime       |
+| **Async, many files** | `luaz_define_async_thread` | Several files, each one task in one scheduler (source, bytecode or FS) |
 
 #### Source vs bytecode: memory comparison
 
@@ -260,6 +269,9 @@ via **message descriptors** stored in `zbus_chan_user_data()` — see
 | `include/`   | Public headers (`luaz_utils.h`, `luaz_zbus.h`, `luaz_fs.h`, …)              |
 | `templates/` | `.c.in` / `.h.in` files used by the CMake code-gen functions                |
 | `scripts/`   | Python helpers (`luaz_gen.py`)                                              |
+| `host_tools/`| Host `luac`                                                                 |
+| `docs/`      | Diagrams used by this README                                                |
+| `tests/`     | Twister tests of the async scheduler (`native_sim`)                         |
 | `samples/`   | Ready-to-build example applications                                         |
 
 ---
@@ -280,6 +292,7 @@ per-thread Kconfig fragments:
 | `luaz_define_source_thread(path)`   | Define a source-embedded Lua thread                     |
 | `luaz_define_bytecode_thread(path)` | Define a bytecode Lua thread (`CONFIG_LUA_PRECOMPILE`)  |
 | `luaz_define_fs_thread(fs_path)`    | Define a filesystem-backed Lua thread (`CONFIG_LUA_FS`) |
+| `luaz_define_async_thread(name SOURCE\|BYTECODE\|FS file...)` | Define async thread `name`; every file (relative to the app or absolute) runs as one task (`CONFIG_LUA_ASYNC`) |
 
 ### Post-Zephyr: code generation
 
@@ -307,6 +320,13 @@ Loaded with `require("zephyr")`. Automatically preloaded by `luaz_openlibs()`.
 | `zephyr.log_dbg(msg)` | Log at DEBUG level          |
 | `zephyr.log_err(msg)` | Log at ERROR level          |
 
+Constants: `zephyr.K_NO_WAIT` (`0`) and `zephyr.K_FOREVER` (`-1`, as Zephyr's
+`SYS_FOREVER_MS`) for timeouts, and the errno values bindings return negated:
+`EAGAIN`, `EBUSY`, `ECANCELED`, `EFAULT`, `EILSEQ`, `EINVAL`, `ENOMEM`,
+`ENOMSG` (compare with `err == -zephyr.EBUSY`). Timeout arguments of the zbus
+bindings take `zephyr.K_FOREVER`, `zephyr.K_NO_WAIT` or a positive number of
+milliseconds; `zephyr.msleep` takes milliseconds (`>= 0`) only.
+
 ### `zephyr.zbus` — zbus bindings
 
 Nested inside the `zephyr` table when `CONFIG_LUA_LIB_ZBUS=y`. Channels and
@@ -317,9 +337,13 @@ observers defined in C are declared from Lua with `channel_declare` /
 | ----------------------------- | --------------------------------------------------------- |
 | `zbus.channel_declare(name)`  | Get a channel userdata by name                            |
 | `zbus.observer_declare(name)` | Get an observer userdata by name                          |
-| `chan:pub(table, timeout_ms)` | Publish a Lua table to a zbus channel                     |
-| `chan:read(timeout_ms)`       | Read the current channel value as a Lua table             |
-| `obs:wait_msg(timeout_ms)`    | Block until a message arrives; returns `err, chan, table` |
+| `chan:pub(table, timeout)`    | Publish a Lua table to a zbus channel; returns `0` or `-errno` |
+| `chan:read(timeout)`          | Read the current channel value; returns `err, table`      |
+| `obs:wait_msg(timeout)`       | Block until a message arrives; returns `err, chan, table` |
+
+These block the calling thread for up to `timeout`. Inside `zephyr.async` tasks
+use `chan:pub_async` / `chan:read_async` instead, which wait without blocking the
+other tasks.
 
 ### `zephyr.fs` — filesystem bindings
 
@@ -333,6 +357,145 @@ filesystem-backed versions, so scripts can use them transparently.
 | `zephyr.fs.dofile(path)`   | Load and execute a Lua script from the filesystem    |
 | `zephyr.fs.loadfile(path)` | Load a script without executing (returns a function) |
 | `zephyr.fs.list([path])`   | List files in a directory                            |
+
+### `zephyr.async` — cooperative tasks
+
+Available in threads with `CONFIG_LUA_ASYNC=y` and
+`CONFIG_<NAME>_LUA_THREAD_ASYNC=y`. The script body is the first task; the
+script ends when every task has finished. Tasks are Lua coroutines run by a C
+scheduler, so they share the thread's stack and heap.
+
+![zephyr.async: one Lua thread runs many tasks behind one zbus subscriber](docs/zephyr_async.svg)
+
+Messages reach the thread through its single zbus subscriber; the scheduler
+hands each one to the tasks awaiting that channel. A task parked in `await` or
+`sleep` lets the others run, and `pub_async` publishes without blocking them.
+
+```lua
+local async = require("zephyr.async")
+local tick = require("zephyr").zbus.channel_declare("chan_tick")
+
+local h = async.spawn(function()
+    local msg, err = tick:await(500)   -- parks this task only
+    return msg and msg.seq
+end)
+async.sleep(100)
+local ok, seq = h:join()
+```
+
+| Function / Method          | Returns                                     | Description                                         |
+| -------------------------- | ------------------------------------------- | --------------------------------------------------- |
+| `async.spawn(fn, ...)`     | task                                        | Start a task; it first runs after the caller yields |
+| `async.sleep(ms)`          | —                                           | Park the calling task                               |
+| `async.yield()`            | —                                           | Let the other ready tasks run                       |
+| `task:join([timeout])`     | `true, ...` / `false, err` / `nil, -EAGAIN` | Wait for the task's results; a cancelled task gives `false, -ECANCELED` |
+| `task:cancel()`            | `boolean`                                   | Stop the task; its `__close` handlers run           |
+| `task:status()`            | `string`                                    | `ready`, `sleeping`, `waiting`, `locking`, `done`, … |
+| `chan:await([timeout])`    | `table` / `nil, -EAGAIN`                    | Next message on the channel (needs a descriptor)    |
+| `chan:pub_async(table[, timeout])` | `true` / `nil, -errno`              | Publish, waiting for a busy channel lock as a task  |
+| `chan:read_async([timeout])` | `table` / `nil, -errno`                   | Read the current value, waiting for the lock as a task |
+| `chan:queue_depth([n])`    | `integer`                                   | Messages kept per channel for slower tasks          |
+| `chan:dropped()`           | `integer`                                   | Messages this task missed by falling behind         |
+
+- Every task that awaits a channel sees every message published after its
+  first `await`. A task that falls more than `queue_depth` messages behind
+  loses the oldest ones. A task that awaits several channels in turn should
+  call `chan:await(zephyr.K_NO_WAIT)` on each one up front, or it misses what
+  arrives on the others before it first gets to them.
+- Timeouts are `zephyr.K_FOREVER` (or `nil`, the default), `zephyr.K_NO_WAIT`, or
+  milliseconds; `async.sleep` takes milliseconds only. Errors come back as
+  negative errno values (`-zephyr.EAGAIN` for a timeout).
+- `pub_async` and `read_async` only wait for the channel lock: a busy lock
+  with `K_NO_WAIT` gives `-EBUSY`, a lock that stays busy until the timeout gives
+  `-EAGAIN`, and in both cases nothing was published. Other errors, such as
+  `-ENOMSG` (an observer's queue was full) or `-ENOMEM` (no message buffers),
+  are returned as they are and can mean some observers already got the message.
+- An error ends only its task. It is printed unless another task is waiting
+  in `join` for it.
+- `join` does not detect cycles: two tasks joining each other with
+  `K_FOREVER` park forever and the thread never ends. Pass a timeout when
+  tasks can depend on each other.
+- `zephyr.msleep`, `obs:wait_msg`, and `chan:pub` / `chan:read` with a timeout
+  other than `K_NO_WAIT` still block the whole thread, and log a warning when
+  used inside a task.
+- `sleep`, `yield`, `await`, `join`, and `pub_async` / `read_async` when they
+  wait must be called from the task itself, not from inside a
+  `coroutine.wrap`/`resume`; there they raise `cannot park inside a coroutine`.
+- Each async thread has its own zbus message subscriber and reader slab,
+  which the generated thread defines. C code that runs a script under the
+  scheduler itself defines them with `LUAZ_ASYNC_DEFINE`:
+
+  ```c
+  /* my_async_sub, my_async_readers (0: default reader count) */
+  LUAZ_ASYNC_DEFINE(my_async, 0);
+
+  /* n functions on top of the stack, each becomes a task */
+  int err = luaz_async_run(L, &my_async, n); /* 0 or -EFAULT */
+  ```
+
+#### Memory and buffering
+
+From the thread's Lua heap (measured on 32-bit `native_sim`):
+
+- Scheduler state: 576 B with the default limits (8 tasks, 8 channels): 40 B
+  per task slot and 24 B per channel record, so it grows with
+  `MAX_TASKS + MAX_CHANNELS` (2208 B at 32 + 32).
+- Each task: about 0.5 KB (548 B for one `spawn`), almost all of it the Lua
+  coroutine (its state and initial stack). A finished task's coroutine is
+  freed at the next garbage collection.
+- Each awaited channel: up to `queue_depth` raw messages, plus one decoded
+  table per reader.
+- Each file of a multi-file thread: its loaded chunk (378 B for a small file).
+  `samples/async_files` (16 tasks) peaks at 26468 B from source and 23900 B as
+  bytecode, of a 32768 B heap.
+
+Outside the Lua heap:
+
+- Read positions: one 16-byte reader (24 B on 64-bit) per (task, channel) pair
+  a task has awaited, from the thread's static `k_mem_slab` of
+  `CONFIG_<NAME>_LUA_ASYNC_MAX_READERS` blocks. The default is
+  min(2 × `MAX_TASKS`, `MAX_TASKS` × `MAX_CHANNELS`): 16 readers, 256 B, with
+  the default limits. A task returns its readers when it ends; `await` raises
+  `too many readers` when the slab is empty.
+
+- Messages wait in the thread's zbus subscriber queue as zbus message buffers
+  (`CONFIG_ZBUS_MSG_SUBSCRIBER_NET_BUF_POOL_SIZE`, 16 by default, shared by all
+  msg subscribers) until a scheduler pass takes them (up to `MAX_DRAIN` per
+  pass). A task that never yields, or a thread blocked in `zephyr.msleep` or
+  `chan:pub`, stops that draining; publishers can then run out of buffers
+  (`-ENOMEM`, or a zbus assertion). `chan:dropped()` counts only messages the
+  ring overwrote, not these failures.
+- Each awaited channel uses one zbus runtime observer node.
+
+#### Tasks in separate files
+
+`luaz_define_async_thread` builds one async thread from several files. Each
+file's top-level code is one task; all of them share the thread's scheduler,
+heap and stack, and start in the order listed:
+
+```cmake
+luaz_define_async_thread(workers SOURCE src/blink.lua src/listener.lua)
+# BYTECODE needs CONFIG_LUA_PRECOMPILE; FS takes filesystem paths and CONFIG_LUA_FS
+```
+
+```lua
+-- src/blink.lua: the whole file is the task
+local async = require("zephyr.async")
+for i = 1, 10 do
+    toggle_led()
+    async.sleep(200)
+end
+```
+
+- The thread is always async: it gets `CONFIG_<NAME>_LUA_THREAD_STACK_SIZE`,
+  `_HEAP_SIZE` and `_PRIORITY`, with the async stack default.
+- Each file takes a task slot (`CONFIG_LUA_ASYNC_MAX_TASKS`); the build fails
+  if there are more files than slots.
+- A file that fails to load is reported and skipped; an error at runtime ends
+  only that file's task.
+- The initial tasks have no handles: nothing can join or cancel them.
+- Embedded files get C symbols prefixed with the thread name, so two threads
+  can use the same file name.
 
 ### Standard Lua libraries
 
@@ -415,7 +578,7 @@ All options live under `Kconfig.luaz`.
 | `CONFIG_LUA_REPL_LINE_SIZE`      | `256`    | Maximum REPL input line length                                       |
 | `CONFIG_LUA_THREAD_STACK_SIZE`   | `2048`   | Default stack size (bytes) for generated Lua threads                 |
 | `CONFIG_LUA_THREAD_HEAP_SIZE`    | `32768`  | Default heap size (bytes) for generated Lua threads                  |
-| `CONFIG_LUA_THREAD_PRIORITY`     | `7`      | Default cooperative priority of generated Lua threads                |
+| `CONFIG_LUA_THREAD_PRIORITY`     | `7`      | Default (preemptive) priority of generated Lua threads               |
 | `CONFIG_LUA_LIBS_ALL`            | `n`      | Preload all standard Lua libraries + zbus                            |
 | `CONFIG_LUA_LIB_STRING`          | if ALL   | Lua string library                                                   |
 | `CONFIG_LUA_LIB_TABLE`           | if ALL   | Lua table library                                                    |
@@ -427,6 +590,14 @@ All options live under `Kconfig.luaz`.
 | `CONFIG_LUA_PRECOMPILE`          | `n`      | Precompile Lua scripts to bytecode at build time                     |
 | `CONFIG_LUA_PRECOMPILE_ONLY`     | `n`      | Exclude the Lua parser from the target (saves ~15-20 KB)             |
 | `CONFIG_LUA_EXTRA_OPTIMIZATIONS` | `n`      | Reduce internal data structure sizes (experimental, bytecode-only)   |
+| `CONFIG_LUA_ASYNC`               | `n`      | Enable `zephyr.async` (per thread: `CONFIG_<NAME>_LUA_THREAD_ASYNC`) |
+| `CONFIG_LUA_ASYNC_MAX_TASKS`     | `8`      | Live tasks per async thread, including the script body or files (max 256) |
+| `CONFIG_LUA_ASYNC_MAX_CHANNELS`  | `8`      | Channels one async thread can await (max 256)                        |
+| `CONFIG_LUA_ASYNC_MAX_READERS`   | `0`      | Awaited (task, channel) pairs per async thread; `0` = min(2 × tasks, tasks × channels) |
+| `CONFIG_LUA_ASYNC_MAX_LOCK_WAITS` | `4`     | Channel locks the idle scheduler sleeps on; beyond it, rechecks every tick |
+| `CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH` | `4`   | Default messages kept per awaited channel                            |
+| `CONFIG_LUA_ASYNC_MAX_DRAIN`     | `16`     | Messages taken from zbus per scheduler pass                          |
+| `CONFIG_LUA_ASYNC_THREAD_STACK_SIZE` | `4096` | Default stack size of async threads                                |
 | `CONFIG_LUA_FS`                  | `n`      | Enable filesystem support for Lua scripts                            |
 | `CONFIG_LUA_FS_MOUNT_POINT`      | `"/lfs"` | Filesystem mount point prefix                                        |
 | `CONFIG_LUA_FS_MAX_FILE_SIZE`    | `4096`   | Maximum Lua script file size (bytes)                                 |
@@ -434,7 +605,9 @@ All options live under `Kconfig.luaz`.
 
 Per-thread overrides: each `luaz_define_*_thread()` generates
 `CONFIG_<SCRIPT>_LUA_THREAD_STACK_SIZE`, `_HEAP_SIZE`, and `_PRIORITY` options
-that default to the global values above.
+that default to the global values above, plus `_ASYNC` (default `n`) and, for
+async threads, `_LUA_ASYNC_MAX_READERS`. Threads from `luaz_define_async_thread`
+are always async.
 
 ## License
 

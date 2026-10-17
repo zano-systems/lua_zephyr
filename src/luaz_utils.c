@@ -15,12 +15,17 @@
 #include <luaz_zbus.h>
 #endif
 #include <sys/times.h>
+#include <sys/types.h>
 #include <time.h>
 #include <zephyr/sys/sys_heap.h>
 #include <zephyr/logging/log.h>
 
 #ifdef CONFIG_LUA_FS
 #include <luaz_fs.h>
+#endif
+
+#ifdef CONFIG_LUA_ASYNC
+#include <luaz_async.h>
 #endif
 
 LOG_MODULE_REGISTER(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
@@ -99,6 +104,12 @@ static int k_msleep_wrapper(lua_State *L)
 	}
 
 	int ms = luaL_checkinteger(L, 1);
+
+	luaL_argcheck(L, ms >= 0, 1, "ms must be >= 0");
+
+#ifdef CONFIG_LUA_ASYNC
+	luaz_async_warn_blocking(L, "zephyr.msleep");
+#endif
 
 	k_msleep(ms);
 
@@ -190,10 +201,39 @@ static const luaL_Reg zephyr_wrappers[] = {
 	{NULL, NULL} /* Sentinel value to mark the end of the array */
 };
 
+k_timeout_t luaz_check_timeout(lua_State *L, int idx)
+{
+	lua_Integer ms = luaL_checkinteger(L, idx);
+
+	if (ms == SYS_FOREVER_MS) {
+		return K_FOREVER;
+	}
+	luaL_argcheck(L, ms >= 0, idx, "timeout must be zephyr.K_FOREVER, zephyr.K_NO_WAIT or ms");
+
+	return ms == 0 ? K_NO_WAIT : K_MSEC(ms);
+}
+
+/* Timeouts, and the errno values (positive, as in C) that bindings return negated. */
+static const struct {
+	const char *name;
+	int value;
+} zephyr_constants[] = {
+	{"K_NO_WAIT", 0},         {"K_FOREVER", SYS_FOREVER_MS},
+	{"EAGAIN", EAGAIN},       {"EBUSY", EBUSY},
+	{"ECANCELED", ECANCELED}, {"EFAULT", EFAULT},
+	{"EILSEQ", EILSEQ},       {"EINVAL", EINVAL},
+	{"ENOMEM", ENOMEM},       {"ENOMSG", ENOMSG},
+};
+
 /** @brief Open the `zephyr` Lua library. Registers kernel wrappers and nests zbus/fs. */
 int luaopen_zephyr(lua_State *L)
 {
 	luaL_newlib(L, zephyr_wrappers);
+
+	for (size_t i = 0; i < ARRAY_SIZE(zephyr_constants); i++) {
+		lua_pushinteger(L, zephyr_constants[i].value);
+		lua_setfield(L, -2, zephyr_constants[i].name);
+	}
 
 #ifdef CONFIG_LUA_LIB_ZBUS
 	/* Nest zbus as zephyr.zbus */
@@ -319,6 +359,53 @@ int _unlink(const char *pathname)
 /** @brief POSIX stub — _link is unused but required by the toolchain. */
 int _link(const char *oldpath, const char *newpath)
 {
+	errno = ENOSYS;
+	return -1;
+}
+
+/*
+ * The base library's loadfile reaches picolibc's fopen, which needs these to
+ * link. Weak, so a real POSIX file layer overrides them.
+ */
+
+__weak int open(const char *path, int flags, ...)
+{
+	ARG_UNUSED(path);
+	ARG_UNUSED(flags);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak int close(int fd)
+{
+	ARG_UNUSED(fd);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak ssize_t read(int fd, void *buf, size_t count)
+{
+	ARG_UNUSED(fd);
+	ARG_UNUSED(buf);
+	ARG_UNUSED(count);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak ssize_t write(int fd, const void *buf, size_t count)
+{
+	ARG_UNUSED(fd);
+	ARG_UNUSED(buf);
+	ARG_UNUSED(count);
+	errno = ENOSYS;
+	return -1;
+}
+
+__weak off_t lseek(int fd, off_t offset, int whence)
+{
+	ARG_UNUSED(fd);
+	ARG_UNUSED(offset);
+	ARG_UNUSED(whence);
 	errno = ENOSYS;
 	return -1;
 }

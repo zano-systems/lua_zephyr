@@ -1,0 +1,122 @@
+/**
+ * @file lua_async_thread.c.in
+ * @brief CMake configure_file template for luaz_define_async_thread().
+ *
+ * Every listed file is loaded and started as a task in one scheduler.
+ * Placeholders (configure_file @ONLY): NAME, NAME_UPPER, LUAZ_MODE (SOURCE,
+ * BYTECODE or FS), LUAZ_COUNT, LUAZ_INCLUDES and LUAZ_LOADS.
+ */
+
+/* clang-format off */
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+#include <luaz_utils.h>
+#include <luaz_async.h>
+#include <zephyr/kernel.h>
+
+#define LUAZ_ASYNC_@LUAZ_MODE@ 1
+
+#ifdef LUAZ_ASYNC_FS
+#include <luaz_fs.h>
+#endif
+
+@LUAZ_INCLUDES@
+
+#ifndef CONFIG_@NAME_UPPER@_LUA_THREAD_ASYNC
+#error "luaz_define_async_thread(@NAME@) requires CONFIG_LUA_ASYNC=y"
+#endif
+
+BUILD_ASSERT(@LUAZ_COUNT@ <= CONFIG_LUA_ASYNC_MAX_TASKS,
+	     "@NAME@: more files than CONFIG_LUA_ASYNC_MAX_TASKS");
+
+static char heap_mem[CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE];
+static struct sys_heap lua_heap;
+
+LUAZ_ASYNC_DEFINE(@NAME@_async, CONFIG_@NAME_UPPER@_LUA_ASYNC_MAX_READERS);
+
+/**
+ * @brief Weak setup hook called before the files are loaded.
+ *
+ * @param L  Lua state for this thread.
+ * @return 0 on success, non-zero to abort.
+ */
+int __weak @NAME@_lua_setup(lua_State *L)
+{
+	ARG_UNUSED(L);
+
+	return 0;
+}
+
+/* Pushes the chunk and returns 1, or reports the error and returns 0. */
+#ifdef LUAZ_ASYNC_FS
+static int load(lua_State *L, const char *path)
+{
+	int top = lua_gettop(L);
+
+	if (lua_fs_loadfile(L, path) == 0) {
+		return 1;
+	}
+	if (lua_gettop(L) > top && lua_isstring(L, -1)) {
+		printk("Lua error: %s\n", lua_tostring(L, -1));
+	} else {
+		printk("Lua error: cannot load %s\n", path);
+	}
+	lua_settop(L, top);
+
+	return 0;
+}
+#else
+static int load(lua_State *L, const char *buf, size_t len, const char *name)
+{
+	if (luaL_loadbuffer(L, buf, len, name) == LUA_OK) {
+		return 1;
+	}
+	printk("Lua error: %s\n", lua_tostring(L, -1));
+	lua_pop(L, 1);
+
+	return 0;
+}
+#endif
+
+/** @brief Thread entry point: init heap, create Lua state, run every file. */
+static void @NAME@_lua_thread(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	int n = 0;
+
+	sys_heap_init(&lua_heap, heap_mem, CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE);
+
+	lua_State *L = lua_newstate(lua_zephyr_allocator, &lua_heap, 0);
+	luaz_openlibs(L);
+
+	if (@NAME@_lua_setup(L) != 0) {
+		lua_close(L);
+		__ASSERT(false, "Setup required to be successful");
+		return;
+	}
+
+	if (lua_checkstack(L, @LUAZ_COUNT@) == 0) {
+		printk("Lua error: no stack space for @LUAZ_COUNT@ files\n");
+		lua_close(L);
+		return;
+	}
+
+@LUAZ_LOADS@
+
+	if (n > 0) {
+		(void)luaz_async_run(L, &@NAME@_async, n);
+	}
+
+	lua_close(L);
+
+	luaz_print_mem_usage(&lua_heap, CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE);
+}
+
+K_THREAD_DEFINE(@NAME@_lua_thread_id, CONFIG_@NAME_UPPER@_LUA_THREAD_STACK_SIZE, @NAME@_lua_thread, NULL, NULL, NULL, CONFIG_@NAME_UPPER@_LUA_THREAD_PRIORITY, 0, 0);
+
+/* clang-format on */
