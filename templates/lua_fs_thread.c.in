@@ -14,6 +14,12 @@
 #include <lauxlib.h>
 #include <lualib.h>
 #include <luaz_utils.h>
+#ifdef CONFIG_LUA_ASYNC
+#include <luaz_async.h>
+#endif
+#ifdef CONFIG_@FILE_NAME_UPPER@_LUA_THREAD_ASYNC
+LUAZ_ASYNC_DEFINE(@FILE_NAME@_async, CONFIG_@FILE_NAME_UPPER@_LUA_ASYNC_MAX_READERS);
+#endif
 #include <luaz_fs.h>
 #include <zephyr/kernel.h>
 
@@ -66,7 +72,14 @@ static void @FILE_NAME@_lua_thread(void*p1, void*p2, void*p3)
         return;
     }
 
+#ifdef CONFIG_@FILE_NAME_UPPER@_LUA_THREAD_ASYNC
+	err = lua_fs_loadfile(L, @FILE_NAME@_script_path);
+	if (err == 0) {
+		(void)luaz_async_run(L, &@FILE_NAME@_async, 1);
+	}
+#else
 	err = lua_fs_dofile(L, @FILE_NAME@_script_path);
+#endif
 	if (err != 0) {
 		if (lua_isstring(L, -1)) {
 			printk("Lua error: %s\n", lua_tostring(L, -1));

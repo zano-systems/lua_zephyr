@@ -17,11 +17,12 @@
 #include <luaz_msg_descr.h>
 #include <zephyr/kernel.h>
 #include <zephyr/init.h>
+#ifdef CONFIG_LUA_ASYNC
+#include <luaz_async.h>
+#endif
 
-/** @brief Metatable name for zbus channel userdata. */
-#define ZBUS_CHAN_METATABLE "zbus.channel.mt"
 /** @brief Metatable name for zbus observer userdata. */
-#define ZBUS_OBS_METATABLE  "zbus.observer.mt"
+#define ZBUS_OBS_METATABLE "zbus.observer.mt"
 
 /** @brief Largest message size across all registered zbus channels (computed at boot). */
 static size_t max_chan_msg_size;
@@ -73,6 +74,11 @@ static int lua_zbus_init(void)
 }
 
 SYS_INIT(lua_zbus_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
+size_t luaz_zbus_max_msg_size(void)
+{
+	return max_chan_msg_size;
+}
 
 /** @brief Validate and return the zbus channel userdata at stack index @p idx. */
 static const struct zbus_channel **check_zbus_channel(lua_State *L, int idx)
@@ -139,7 +145,13 @@ static int chan_pub(lua_State *L)
 
 	luaL_checktype(L, 2, LUA_TTABLE);
 
-	int timeout_ms = luaL_checkinteger(L, 3);
+	k_timeout_t timeout = luaz_check_timeout(L, 3);
+
+#ifdef CONFIG_LUA_ASYNC
+	if (!K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+		luaz_async_warn_blocking(L, "channel:pub");
+	}
+#endif
 
 	size_t msg_size = zbus_chan_msg_size(*chan);
 	void *msg = lua_alloc_raw(L, msg_size);
@@ -152,7 +164,7 @@ static int chan_pub(lua_State *L)
 	size_t s = lua_table_to_msg_struct(L, *chan, msg);
 
 	if (s) {
-		err = zbus_chan_pub(*chan, msg, K_MSEC(timeout_ms));
+		err = zbus_chan_pub(*chan, msg, timeout);
 	}
 
 	lua_free_raw(L, msg, msg_size);
@@ -173,7 +185,13 @@ static int chan_read(lua_State *L)
 	}
 
 	const struct zbus_channel **chan = check_zbus_channel(L, 1);
-	int timeout_ms = luaL_checkinteger(L, 2);
+	k_timeout_t timeout = luaz_check_timeout(L, 2);
+
+#ifdef CONFIG_LUA_ASYNC
+	if (!K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+		luaz_async_warn_blocking(L, "channel:read");
+	}
+#endif
 
 	size_t msg_size = zbus_chan_msg_size(*chan);
 	void *msg = lua_alloc_raw(L, msg_size);
@@ -184,7 +202,7 @@ static int chan_read(lua_State *L)
 		return 2;
 	}
 
-	err = zbus_chan_read(*chan, msg, K_MSEC(timeout_ms));
+	err = zbus_chan_read(*chan, msg, timeout);
 
 	lua_pushinteger(L, err);
 
@@ -244,7 +262,11 @@ static int sub_wait_msg(lua_State *L)
 	const struct zbus_channel *chan;
 
 	const struct zbus_observer **obs = check_zbus_observer(L, 1);
-	int timeout_ms = luaL_checkinteger(L, 2);
+	k_timeout_t timeout = luaz_check_timeout(L, 2);
+
+#ifdef CONFIG_LUA_ASYNC
+	luaz_async_warn_blocking(L, "observer:wait_msg");
+#endif
 
 	void *msg = lua_alloc_raw(L, max_chan_msg_size);
 
@@ -255,7 +277,7 @@ static int sub_wait_msg(lua_State *L)
 		return 3;
 	}
 
-	int err = zbus_sub_wait_msg(*obs, &chan, msg, K_MSEC(timeout_ms));
+	int err = zbus_sub_wait_msg(*obs, &chan, msg, timeout);
 
 	lua_pushinteger(L, err);
 
