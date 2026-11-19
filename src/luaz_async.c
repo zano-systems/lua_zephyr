@@ -23,6 +23,10 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/zbus/zbus.h>
 
+#if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
+#include <zephyr/timing/timing.h>
+#endif
+
 LOG_MODULE_DECLARE(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
 
 #define HANDLE_MT "zephyr.async.handle"
@@ -97,6 +101,9 @@ struct loop {
 	int ntimed;
 	bool draining;
 	struct k_mem_slab *readers;
+#ifdef CONFIG_LUA_ASYNC_STATS
+	struct luaz_async_stats *stats;
+#endif
 	struct task tasks[MAX_TASKS];
 	struct chan chans[MAX_CHANS];
 	int16_t runq[MAX_TASKS];
@@ -107,6 +114,55 @@ struct handle {
 	int slot;
 	uint8_t final;
 };
+
+/* Profiling counters (CONFIG_LUA_ASYNC_STATS); no code when disabled. */
+#ifdef CONFIG_LUA_ASYNC_STATS
+#ifdef CONFIG_TIMING_FUNCTIONS
+#define STAT_CLOCK timing_t
+
+static inline timing_t stat_now(void)
+{
+	return timing_counter_get();
+}
+
+static inline uint64_t stat_since(timing_t t0)
+{
+	timing_t t1 = timing_counter_get();
+
+	return timing_cycles_get(&t0, &t1);
+}
+
+static uint32_t stat_hz(void)
+{
+	return (uint32_t)timing_freq_get();
+}
+#else
+#define STAT_CLOCK uint32_t
+
+static inline uint32_t stat_now(void)
+{
+	return k_cycle_get_32();
+}
+
+static inline uint64_t stat_since(uint32_t t0)
+{
+	return (uint32_t)(k_cycle_get_32() - t0);
+}
+
+static uint32_t stat_hz(void)
+{
+	return (uint32_t)sys_clock_hw_cycles_per_sec();
+}
+#endif
+#define STAT_ADD(_lp, _f, _n) ((_lp)->stats->_f += (_n))
+#define STAT_T0(_v)           STAT_CLOCK _v = stat_now()
+#define STAT_CYC(_lp, _f, _v) ((_lp)->stats->_f += stat_since(_v))
+#else
+#define STAT_ADD(_lp, _f, _n) ((void)(_lp))
+#define STAT_T0(_v)           (void)0
+#define STAT_CYC(_lp, _f, _v) ((void)(_lp))
+#endif
+#define STAT_INC(_lp, _f) STAT_ADD(_lp, _f, 1)
 
 static struct loop *get_loop(lua_State *L)
 {
@@ -308,6 +364,7 @@ static void wake(lua_State *L, struct loop *lp, int slot, int nvals)
 {
 	struct task *t = &lp->tasks[slot];
 
+	STAT_INC(lp, wakes);
 	clear_deadline(lp, slot);
 	t->state = T_READY;
 	t->target = -1;
@@ -325,6 +382,7 @@ static int parked_on(struct loop *lp, uint8_t st, int target, int16_t out[MAX_TA
 {
 	int n = 0;
 
+	STAT_ADD(lp, scans, MAX_TASKS);
 	for (int s = 0; s < MAX_TASKS; s++) {
 		const struct task *t = &lp->tasks[s];
 		int i;
@@ -522,7 +580,10 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 
 	t->state = T_RUNNING;
 	lp->current = slot;
+	STAT_INC(lp, resumes);
+	STAT_T0(t0);
 	st = lua_resume(co, L, t->nreply, &nres);
+	STAT_CYC(lp, cyc_resume, t0);
 	lp->current = -1;
 	t->nreply = 0;
 
@@ -693,6 +754,7 @@ static void push_decoded(lua_State *L, struct loop *lp, int c, uint32_t seq)
 	/* Lua string data may be misaligned for the struct. */
 	memcpy(cl->buf, raw, len);
 	lua_pop(L, 2);
+	STAT_INC(lp, decodes);
 	lua_msg_descr_to_table(L, descr->fields, descr->field_count, cl->buf);
 }
 
@@ -764,6 +826,7 @@ static int poll(lua_State *L, const struct zbus_channel **chan)
 
 static void check_locks(lua_State *L, struct loop *lp)
 {
+	STAT_ADD(lp, scans, MAX_TASKS);
 	for (int s = 0; s < MAX_TASKS; s++) {
 		struct task *t = &lp->tasks[s];
 
@@ -787,6 +850,7 @@ static void idle_wait(lua_State *L, struct loop *lp, int32_t timeout_ms)
 
 	k_poll_event_init(&ev[n++], K_POLL_TYPE_FIFO_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY,
 			  check_rx(L)->ctx->sub->message_fifo);
+	STAT_ADD(lp, scans, MAX_TASKS);
 	for (int s = 0; s < MAX_TASKS && !overflow; s++) {
 		struct k_sem *sem;
 		int i = 1;
@@ -829,6 +893,7 @@ static bool drain(lua_State *L, struct loop *lp)
 			hit_limit = false;
 			break;
 		}
+		STAT_INC(lp, msgs);
 		deliver(L, lp, key);
 		lua_pop(L, 1);
 	}
@@ -842,10 +907,20 @@ static int loop_body(lua_State *L)
 	struct loop *lp = get_loop(L);
 
 	while (lp->live > 0) {
-		bool hit_limit = drain(L, lp);
+		bool hit_limit;
 
+		STAT_INC(lp, passes);
+		STAT_T0(t_drain);
+		hit_limit = drain(L, lp);
+		STAT_CYC(lp, cyc_drain, t_drain);
+
+		STAT_T0(t_expire);
 		expire(L, lp);
+		STAT_CYC(lp, cyc_expire, t_expire);
+
+		STAT_T0(t_locks);
 		check_locks(L, lp);
+		STAT_CYC(lp, cyc_locks, t_locks);
 
 		/* Tasks made ready while running wait for the next pass. */
 		lp->pass_left = lp->rq_len;
@@ -864,7 +939,10 @@ static int loop_body(lua_State *L)
 					timeout = 0;
 				}
 			}
+			STAT_INC(lp, idle_waits);
+			STAT_T0(t_idle);
 			idle_wait(L, lp, timeout);
+			STAT_CYC(lp, cyc_idle, t_idle);
 		}
 	}
 
@@ -904,6 +982,11 @@ static int l_run(lua_State *L)
 	memset(lp, 0, sizeof(*lp));
 	lp->current = -1;
 	lp->readers = check_rx(L)->ctx->readers;
+#ifdef CONFIG_LUA_ASYNC_STATS
+	lp->stats = check_rx(L)->ctx->stats;
+	memset(lp->stats, 0, sizeof(*lp->stats));
+	lp->stats->cyc_hz = stat_hz();
+#endif
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &loop_key);
 
 	for (int i = 1; i <= n; i++) {
@@ -913,7 +996,11 @@ static int l_run(lua_State *L)
 
 	lua_pushcfunction(L, fault_handler);
 	lua_pushcfunction(L, loop_body);
-	st = lua_pcall(L, 0, 0, -2);
+	{
+		STAT_T0(t_total);
+		st = lua_pcall(L, 0, 0, -2);
+		STAT_CYC(lp, cyc_total, t_total);
+	}
 	lp->current = -1;
 
 	if (st != LUA_OK) {
@@ -1436,6 +1523,36 @@ static int l_read_async(lua_State *L)
 	return start_lock_op(L, "read_async", 2, 0);
 }
 
+#ifdef CONFIG_LUA_ASYNC_STATS
+/* async.stats() -> table of the current run's counters */
+static int l_stats(lua_State *L)
+{
+	const struct luaz_async_stats *st = check_rx(L)->ctx->stats;
+
+	lua_createtable(L, 0, 14);
+#define STAT_FIELD(_f)                                                                             \
+	lua_pushinteger(L, (lua_Integer)st->_f);                                                   \
+	lua_setfield(L, -2, #_f)
+	STAT_FIELD(passes);
+	STAT_FIELD(resumes);
+	STAT_FIELD(wakes);
+	STAT_FIELD(idle_waits);
+	STAT_FIELD(msgs);
+	STAT_FIELD(decodes);
+	STAT_FIELD(scans);
+	STAT_FIELD(cyc_hz);
+	STAT_FIELD(cyc_total);
+	STAT_FIELD(cyc_resume);
+	STAT_FIELD(cyc_idle);
+	STAT_FIELD(cyc_drain);
+	STAT_FIELD(cyc_expire);
+	STAT_FIELD(cyc_locks);
+#undef STAT_FIELD
+
+	return 1;
+}
+#endif
+
 static const luaL_Reg handle_methods[] = {
 	{"join", l_join},
 	{"cancel", l_cancel},
@@ -1449,9 +1566,10 @@ static const luaL_Reg chan_methods[] = {
 };
 
 static const luaL_Reg module_funcs[] = {
-	{"spawn", l_spawn},
-	{"sleep", l_sleep},
-	{"yield", l_yield},
+	{"spawn", l_spawn}, {"sleep", l_sleep}, {"yield", l_yield},
+#ifdef CONFIG_LUA_ASYNC_STATS
+	{"stats", l_stats},
+#endif
 	{NULL, NULL},
 };
 
@@ -1533,6 +1651,10 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 		return -ENOMEM;
 	}
 	outer = get_loop(L);
+#if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
+	timing_init();
+	timing_start();
+#endif
 
 	c = lua_newuserdatauv(L, sizeof(*c) + buf_size, 0);
 	c->ctx = ctx;

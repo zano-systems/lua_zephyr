@@ -130,6 +130,14 @@ config LUA_EXTRA_OPTIMIZATIONS
       Saves ~636 bytes per lua_newstate on 32-bit targets by reducing
       the string table initial size (128->64) and string cache (53x2->11x1).
 
+config LUA_ALLOC_STATS
+    bool "Count Lua allocator calls"
+    help
+      Count allocations, frees, reallocations and requested bytes in
+      lua_zephyr_allocator() across all Lua states. Read them with
+      luaz_alloc_stats_get(). For profiling; adds atomic operations to
+      every allocation.
+
 config LUA_ASYNC
     bool "Cooperative async scheduler (zephyr.async)"
     select ZBUS_RUNTIME_OBSERVERS
@@ -202,6 +210,17 @@ config LUA_ASYNC_THREAD_STACK_SIZE
     default 4096
     help
       Default stack size of threads with CONFIG_<NAME>_LUA_THREAD_ASYNC=y.
+
+config LUA_ASYNC_STATS
+    bool "Scheduler counters and per-phase cycle accounting"
+    imply TIMING_FUNCTIONS
+    help
+      Count scheduler passes, resumes, wakeups, delivered messages and
+      task-slot scans, and accumulate the cycles spent in each scheduler
+      phase. Read them with async.stats() or the stats pointer of the
+      context from LUAZ_ASYNC_DEFINE. Cycles come from the timing API
+      (DWT on Cortex-M) when TIMING_FUNCTIONS is available, else from
+      k_cycle_get_32(). For profiling only.
 
 endif # LUA_ASYNC
 
