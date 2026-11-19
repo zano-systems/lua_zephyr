@@ -1,0 +1,20 @@
+common:
+  tags: lua_zephyr
+  platform_allow:
+    - mps2/an385
+    - nrf52833dk/nrf52833
+    - native_sim
+    - native_sim/native/64
+  integration_platforms:
+    - mps2/an385
+  harness: console
+  timeout: 300
+  harness_config:
+    type: one_line
+    regex:
+      - "bench done: 0 failed"
+tests:
+  lua_zephyr.async_bench: {}
+  lua_zephyr.async_bench.breakdown:
+    extra_configs:
+      - CONFIG_LUA_ASYNC_STATS=y
