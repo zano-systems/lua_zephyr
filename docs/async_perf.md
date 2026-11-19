@@ -12,7 +12,7 @@ goes, and what the optimizations on `perf/async-scheduler` bought.
 | `CONFIG_LUA_ALLOC_STATS` | Allocator calls, requested bytes, live/peak bytes | `luaz_alloc_stats_get()` |
 | `scripts/bench_table.py` | Markdown table of one run, or before/after deltas of two | `bench_table.py base.log new.log` |
 | `scripts/pc_sample.py` | Statistical function-level profile over J-Link (PC + LR samples mapped to ELF symbols) | build `tests/async_bench` with `CONFIG_BENCH_PROFILE="<case>"`, flash, run the script |
-| zview | Thread CPU shares, stack watermarks, slab peaks, without instrumentation | `zview dump -e zephyr.elf -r jlink -t NRF52833_XXAA --json` |
+| zview | Thread CPU shares, Lua heap use and peak (each Lua heap is a `k_heap` named `<thread>_lua_heap`), stack watermarks, slab peaks, without instrumentation | `zview dump -e zephyr.elf -r jlink -t NRF52833_XXAA --json` |
 
 Cycle counts are only meaningful on hardware: the nRF52833 numbers use the DWT
 cycle counter (`CONFIG_TIMING_FUNCTIONS` and
@@ -28,17 +28,17 @@ instrumentation added and disabled.
 
 | bench | baseline | now | Δ | allocs/op |
 |---|---:|---:|---:|---|
-| yield/2 | 2694 | 1261 | −53% | 0.00 → 0.00 |
-| yield/8 | 2281 | 1229 | −46% | 0.03 → 0.01 |
-| yield/32 | 2288 | 1294 | −43% | 0.11 → 0.06 |
-| sleep/16 | 5385 | 3539 | −34% | 0.71 → 0.41 |
-| await_fanout/1 (per delivery) | 28996 | 13082 | −55% | 5.12 → 2.06 |
-| await_fanout/4 | 23919 | 10774 | −55% | 4.30 → 2.03 |
-| await_fanout/8 | 22405 | 10736 | −52% | 4.17 → 2.02 |
-| await_multi/4 | 31035 | 13928 | −55% | 5.17 → 2.06 |
-| pub_async | 9076 | 7918 | −13% | 1.02 → 1.01 |
-| read_async | 17267 | 9254 | −46% | 5.02 → 3.01 |
-| spawn_join | 23825 | 22676 | −5% | 7.05 → 7.04 |
+| yield/2 | 2694 | 1260 | −53% | 0.00 → 0.00 |
+| yield/8 | 2281 | 1224 | −46% | 0.03 → 0.01 |
+| yield/32 | 2288 | 1290 | −44% | 0.11 → 0.06 |
+| sleep/16 | 5385 | 3402 | −37% | 0.71 → 0.41 |
+| await_fanout/1 (per delivery) | 28996 | 12742 | −56% | 5.12 → 2.06 |
+| await_fanout/4 | 23919 | 10631 | −56% | 4.30 → 2.03 |
+| await_fanout/8 | 22405 | 10616 | −53% | 4.17 → 2.02 |
+| await_multi/4 | 31035 | 13565 | −56% | 5.17 → 2.06 |
+| pub_async | 9076 | 7926 | −13% | 1.02 → 1.01 |
+| read_async | 17267 | 9214 | −47% | 5.02 → 3.01 |
+| spawn_join | 23825 | 22801 | −4% | 7.05 → 7.04 |
 
 Incremental GC. Generational GC gives the same cycle counts within a few
 percent.
@@ -53,6 +53,7 @@ percent.
 | `perf(async): skip idle scheduler phases` | No lock scans, uptime reads or FIFO locks when idle: yield/2 −18% |
 | `perf(async): resolve channels against an upvalue metatable` | No `luaL_testudata` name lookup, 2 instead of 3 per await: awaits −11 to −14% |
 | `perf(async): pass park requests through the task record` | No tag/kind/args on the coroutine stack: yield −19 to −22%, sleep −18% |
+| `perf(async): keep one lazily re-armed idle timer` | No kernel timeout added and aborted per idle wait: sleep −5%, timed awaits −1 to −3% |
 
 ## Where the time goes now
 
@@ -75,6 +76,7 @@ Phase split (`.breakdown` scenario, share of the Lua thread's busy time):
   - The scheduler's own linear scan (`parked_on`) is 1.5%.
 - **zview** (steady-state `await_fanout/1`): Lua thread 76% CPU, publisher 24%
   (`zbus_chan_pub` + net_buf), idle 0%. Stack watermark 2.9 KB of 8 KB.
+  `bench_lua_heap` showed 43 KB in use and a 46.7 KB peak out of 64 KB.
 
 ## Configuration notes
 
@@ -84,8 +86,8 @@ Phase split (`.breakdown` scenario, share of the Lua thread's busy time):
 - **`ZBUS_MSG_SUBSCRIBER_BUF_ALLOC_STATIC`** vs. the dynamic default: no
   measurable change on the Lua side (<1%). The per-publish allocation lands on
   the publisher thread.
-- **`K_FOREVER` awaits** avoid the per-idle timer arm/abort that timed awaits
-  pay.
+- **Timed awaits** re-arm the idle timer about once per timeout period. A
+  `K_FOREVER` await never arms it.
 - `CONFIG_LUA_ASYNC_MAX_TASKS` sizes the remaining linear scans (`parked_on`,
   slot allocation). Keep it near the real task count.
 
@@ -96,10 +98,6 @@ Phase split (`.breakdown` scenario, share of the Lua thread's busy time):
 - **One decoded table shared by all waiters** of a message: fan-out would
   decode once instead of K times. This changes semantics, since a waiter that
   mutates the table would affect the others.
-- **Persistent idle timer**: re-arm only when the earliest deadline changes,
-  instead of on every `k_poll`.
-- **zview cannot see the Lua heaps**: the generated threads use a raw
-  `sys_heap`, and zview discovers `k_heap` objects.
 
 ## Reproducing
 
