@@ -254,11 +254,22 @@ static struct rx *check_rx(lua_State *L)
 	return c;
 }
 
+/*
+ * Channel methods carry the channel metatable as upvalue 2: comparing against
+ * it avoids luaL_testudata()'s registry lookup by name.
+ */
 static const struct zbus_channel *to_chan(lua_State *L, int idx)
 {
-	const struct zbus_channel **ud = luaL_testudata(L, idx, ZBUS_CHAN_METATABLE);
+	const struct zbus_channel **ud = lua_touserdata(L, idx);
+	bool ok;
 
-	return ud != NULL ? *ud : NULL;
+	if (ud == NULL || lua_getmetatable(L, idx) == 0) {
+		return NULL;
+	}
+	ok = lua_rawequal(L, -1, lua_upvalueindex(2));
+	lua_pop(L, 1);
+
+	return ok ? *ud : NULL;
 }
 
 static int32_t uptime(void)
@@ -760,9 +771,8 @@ static uint8_t *ring_new(lua_State *L, size_t stride, lua_Integer depth)
 }
 
 /* -1 when every channel record is taken. */
-static int chan_get(lua_State *L, struct loop *lp, int idx)
+static int chan_get(lua_State *L, struct loop *lp, const struct zbus_channel *key, int idx)
 {
-	const struct zbus_channel *key = to_chan(L, idx);
 	size_t stride;
 	uint8_t *ring;
 	int ring_ref;
@@ -1367,7 +1377,7 @@ static int await_try(lua_State *L)
 	struct chan *ch;
 	int c;
 
-	c = chan_get(L, lp, 1);
+	c = chan_get(L, lp, chan, 1);
 	if (c < 0) {
 		return luaL_error(L, "await: cannot watch '%s' (%d)", zbus_chan_name(chan),
 				  -ENOMEM);
@@ -1468,7 +1478,7 @@ static int l_queue_depth(lua_State *L)
 	if (lp == NULL) {
 		return luaL_error(L, "async: not running under the scheduler");
 	}
-	c = chan_get(L, lp, 1);
+	c = chan_get(L, lp, to_chan(L, 1), 1);
 	if (c < 0) {
 		return luaL_error(L,
 				  "queue_depth: too many channels (CONFIG_LUA_ASYNC_MAX_CHANNELS)");
@@ -1686,7 +1696,8 @@ static int luaz_async_open(lua_State *L)
 		lua_setfield(L, -2, "__index");
 	}
 	lua_rawgetp(L, LUA_REGISTRYINDEX, &anchor_key);
-	luaL_setfuncs(L, chan_methods, 1);
+	lua_pushvalue(L, -2);
+	luaL_setfuncs(L, chan_methods, 2);
 	lua_pop(L, 1);
 
 	luaL_newlibtable(L, module_funcs);
