@@ -2,8 +2,9 @@
  * @file luaz_async.c
  * @brief zephyr.async: cooperative scheduler on zbus, and its thread entry.
  *
- * Parking calls yield `REQ, kind, args...`. On wake, the reply is pushed onto
- * the task's stack, so it becomes the parking call's return values.
+ * A parking call stores its request in the task record and yields no values,
+ * so a yield without a request is a stray coroutine.yield. On wake, the reply
+ * is pushed onto the task's stack and becomes the parking call's results.
  */
 
 #include <errno.h>
@@ -41,8 +42,6 @@ static const char loop_key;
 static const char anchor_key;
 static const char rx_key;
 static const char warned_key;
-static const char req_tag;
-#define REQ ((void *)&req_tag)
 
 enum {
 	KIND_YIELD = 1,
@@ -78,9 +77,12 @@ struct task {
 	int nreply;          /* values on co's stack for the next resume */
 	sys_slist_t readers; /* struct luaz_async_reader, one per awaited channel */
 	const struct zbus_channel *lock_chan; /* T_LOCKING: the lock it waits for */
+	int32_t req_ms;                       /* request: timeout, -1 for forever */
 	int16_t target;                       /* T_WAITING: channel; T_JOINING: task; else -1 */
+	int16_t req_target;                   /* request: channel or task */
 	uint8_t state;
 	uint8_t has_deadline;
+	uint8_t req; /* KIND_* set by the parking call, 0 for none */
 };
 
 struct chan {
@@ -642,8 +644,8 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 	struct task *t = &lp->tasks[slot];
 	lua_State *co = t->co;
 	int nres = 0;
+	int kind;
 	int st;
-	int base;
 
 	t->state = T_RUNNING;
 	lp->current = slot;
@@ -657,6 +659,11 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 	if (st == LUA_OK) {
 		int top = lua_gettop(L);
 
+		if (t->handle_ref == LUA_NOREF) {
+			/* An initial task: no handle keeps the results, so no one can join. */
+			retire(L, lp, slot, H_DONE, 0);
+			return;
+		}
 		luaL_checkstack(L, nres + 4, "async: results");
 		lua_pushboolean(L, 1);
 		lua_xmove(co, L, nres);
@@ -699,10 +706,10 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 		return;
 	}
 
-	/* Untagged yields come from coroutine.yield in a task body. */
-	base = lua_gettop(co) - nres + 1;
-	if (nres < 2 || lua_touserdata(co, base) != REQ ||
-	    lua_type(co, base) != LUA_TLIGHTUSERDATA) {
+	/* Yields without a request come from coroutine.yield in a task body. */
+	kind = t->req;
+	t->req = 0;
+	if (kind == 0 || nres != 0) {
 		lua_pop(co, nres);
 		(void)close_task(L, lp, slot);
 		lua_pop(L, 1);
@@ -712,36 +719,33 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 		return;
 	}
 
-	switch (lua_tointeger(co, base + 1)) {
+	switch (kind) {
 	case KIND_YIELD:
 		t->state = T_READY;
 		enqueue(lp, slot);
 		break;
 	case KIND_SLEEP:
 		t->state = T_SLEEPING;
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 2));
+		park(L, lp, slot, t->req_ms);
 		break;
 	case KIND_AWAIT:
 		t->state = T_WAITING;
-		t->target = (int16_t)lua_tointeger(co, base + 2);
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 3));
+		t->target = t->req_target;
+		park(L, lp, slot, t->req_ms);
 		break;
 	case KIND_JOIN:
 		t->state = T_JOINING;
-		t->target = (int16_t)lua_tointeger(co, base + 2);
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 3));
+		t->target = t->req_target;
+		park(L, lp, slot, t->req_ms);
 		break;
 	case KIND_LOCK:
 		t->state = T_LOCKING;
 		lp->nlocking++;
-		t->lock_chan = lua_touserdata(co, base + 2);
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 3));
+		park(L, lp, slot, t->req_ms);
 		break;
 	default:
-		lua_pop(co, nres);
 		luaL_error(L, "async: unknown request");
 	}
-	lua_pop(co, nres);
 }
 
 static int chan_find(struct loop *lp, const struct zbus_channel *key)
@@ -1149,30 +1153,33 @@ static int l_run(lua_State *L)
 	return 1;
 }
 
-static void check_parkable(lua_State *L)
+/*
+ * Records the parking request of the current task. When the task cannot
+ * yield, nothing is recorded and the caller's lua_yield raises its usual
+ * error, so a request is only ever left behind by a real yield.
+ */
+static void set_request(lua_State *L, int kind, int target, int32_t ms)
 {
 	struct loop *lp = up_loop(L);
+	struct task *t = &lp->tasks[lp->current];
 
 	/* From a nested coroutine the yield would reach its resumer, not the scheduler. */
-	if (L != lp->tasks[lp->current].co) {
+	if (L != t->co) {
 		luaL_error(L, "async: cannot park inside a coroutine");
 	}
+	if (!lua_isyieldable(L)) {
+		return;
+	}
+	t->req = (uint8_t)kind;
+	t->req_target = (int16_t)target;
+	t->req_ms = ms;
 }
 
-static int request(lua_State *L, int kind, int a, int32_t b, int nargs)
+static int request(lua_State *L, int kind, int target, int32_t ms)
 {
-	check_parkable(L);
+	set_request(L, kind, target, ms);
 
-	lua_pushlightuserdata(L, REQ);
-	lua_pushinteger(L, kind);
-	if (nargs >= 1) {
-		lua_pushinteger(L, a);
-	}
-	if (nargs >= 2) {
-		lua_pushinteger(L, b);
-	}
-
-	return lua_yield(L, 2 + nargs);
+	return lua_yield(L, 0);
 }
 
 static int l_spawn(lua_State *L)
@@ -1210,17 +1217,17 @@ static int l_sleep(lua_State *L)
 
 	(void)cur_slot(L, up_loop(L));
 	if (ms == 0) {
-		return request(L, KIND_YIELD, 0, 0, 0);
+		return request(L, KIND_YIELD, -1, 0);
 	}
 
-	return request(L, KIND_SLEEP, ms, 0, 1);
+	return request(L, KIND_SLEEP, -1, ms);
 }
 
 static int l_yield(lua_State *L)
 {
 	(void)cur_slot(L, up_loop(L));
 
-	return request(L, KIND_YIELD, 0, 0, 0);
+	return request(L, KIND_YIELD, -1, 0);
 }
 
 static struct handle *check_handle(lua_State *L)
@@ -1264,7 +1271,7 @@ static int l_join(lua_State *L)
 		return 2;
 	}
 
-	return request(L, KIND_JOIN, h->slot, ms, 2);
+	return request(L, KIND_JOIN, h->slot, ms);
 }
 
 static int l_cancel(lua_State *L)
@@ -1343,13 +1350,10 @@ static int32_t time_left(lua_State *L, int idx)
 static int park_on_lock(lua_State *L, const struct zbus_channel *chan, int32_t left,
 			lua_KContext ctx, lua_KFunction k)
 {
-	check_parkable(L);
-	lua_pushlightuserdata(L, REQ);
-	lua_pushinteger(L, KIND_LOCK);
-	lua_pushlightuserdata(L, (void *)chan);
-	lua_pushinteger(L, left);
+	set_request(L, KIND_LOCK, -1, left);
+	up_loop(L)->tasks[up_loop(L)->current].lock_chan = chan;
 
-	return lua_yieldk(L, 4, ctx, k);
+	return lua_yieldk(L, 0, ctx, k);
 }
 
 static int await_try(lua_State *L);
@@ -1425,7 +1429,7 @@ static int await_try(lua_State *L)
 			return 1;
 		}
 		if (left != 0) {
-			return request(L, KIND_AWAIT, c, left, 2);
+			return request(L, KIND_AWAIT, c, left);
 		}
 		if (drained) {
 			break;
