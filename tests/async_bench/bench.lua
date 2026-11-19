@@ -19,6 +19,17 @@ local chans = {
 }
 local NAMES = { "b_c0", "b_c1", "b_c2", "b_c3" }
 
+-- CONFIG_BENCH_PROFILE: run one case forever for PC sampling.
+local PROFILE = bench.profile
+if PROFILE ~= "" then
+	local measure = bench.measure
+	bench.measure = function(name, ...)
+		if name == PROFILE then
+			return measure(name, ...)
+		end
+	end
+end
+
 -- Context switches: ntasks round-robin through async.yield().
 local function yield_bench(ntasks, iters)
 	local fns = {}
@@ -122,18 +133,20 @@ local function spawn_bench(n)
 	end)
 end
 
-for _, mode in ipairs({ "inc", "gen" }) do
-	bench.gc(mode)
-	yield_bench(2, 1000)
-	yield_bench(8, 250)
-	yield_bench(32, 64)
-	sleep_bench(16, 10)
-	await_fanout(1, 200)
-	await_fanout(4, 200)
-	await_fanout(8, 200)
-	await_multi(4, 400)
-	lock_bench(500)
-	spawn_bench(200)
-end
+repeat
+	for _, mode in ipairs({ "inc", "gen" }) do
+		bench.gc(mode)
+		yield_bench(2, 1000)
+		yield_bench(8, 250)
+		yield_bench(32, 64)
+		sleep_bench(16, 10)
+		await_fanout(1, 200)
+		await_fanout(4, 200)
+		await_fanout(8, 200)
+		await_multi(4, 400)
+		lock_bench(500)
+		spawn_bench(200)
+	end
+until PROFILE == ""
 
 bench.done()

@@ -1,3 +1,10 @@
+config BENCH_PROFILE
+	string "Run only this bench case, forever, without output"
+	default ""
+	help
+	  For PC sampling (scripts/pc_sample.py): the named case (e.g.
+	  "await_fanout/1") runs in a loop and nothing is printed.
+
 menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu

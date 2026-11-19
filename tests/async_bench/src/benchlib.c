@@ -211,6 +211,10 @@ static int l_measure(lua_State *L)
 	us = wall_us();
 	luaz_alloc_stats_get(&a);
 
+	if (CONFIG_BENCH_PROFILE[0] != '\0') {
+		lua_pushinteger(L, rc);
+		return 1;
+	}
 	allocs_x100 = (uint32_t)(((uint64_t)a.allocs * 100U) / (uint64_t)ops);
 	printk("BENCH %s ops=%d cyc=%" PRIu64 " cyc/op=%" PRIu64 " wall_us=%" PRIu64
 	       " allocs/op=%u.%02u bytes/op=%u peak=%u gc=%s rc=%d\n",
@@ -274,6 +278,8 @@ static int luaopen_bench(lua_State *L)
 	};
 
 	luaL_newlib(L, funcs);
+	lua_pushstring(L, CONFIG_BENCH_PROFILE);
+	lua_setfield(L, -2, "profile");
 
 	return 1;
 }
