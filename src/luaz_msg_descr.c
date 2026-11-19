@@ -26,7 +26,8 @@
 void lua_msg_descr_to_table(lua_State *L, const struct lua_msg_field_descr *fields,
 			    size_t field_count, const void *base)
 {
-	lua_newtable(L);
+	/* Presized: one hash allocation instead of a rehash at each power of two. */
+	lua_createtable(L, 0, (int)field_count);
 
 	for (size_t i = 0; i < field_count; i++) {
 		const struct lua_msg_field_descr *f = &fields[i];
