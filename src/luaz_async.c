@@ -84,7 +84,9 @@ struct task {
 
 struct chan {
 	const struct zbus_channel *key; /* NULL: free */
-	int ring_ref;                   /* seq -> raw message */
+	int ring_ref;                   /* registry ref anchoring ring */
+	uint8_t *ring;                  /* depth slots of stride bytes; seq % depth */
+	size_t stride;                  /* message size rounded up for alignment */
 	uint32_t head;                  /* newest seq */
 	uint32_t low;                   /* oldest seq held */
 	int depth;
@@ -687,10 +689,27 @@ static int chan_find(struct loop *lp, const struct zbus_channel *key)
 	return -1;
 }
 
+static uint8_t *ring_slot(const struct chan *ch, uint32_t seq)
+{
+	return ch->ring + (size_t)(seq % (uint32_t)ch->depth) * ch->stride;
+}
+
+/* Pushes a ring userdata of depth slots; raises on overflow or no memory. */
+static uint8_t *ring_new(lua_State *L, size_t stride, lua_Integer depth)
+{
+	if ((uint64_t)depth > (uint64_t)(SIZE_MAX / stride) || depth > INT32_MAX) {
+		luaL_error(L, "queue_depth: depth %d is too large", (int)depth);
+	}
+
+	return lua_newuserdatauv(L, stride * (size_t)depth, 0);
+}
+
 /* -1 when every channel record is taken. */
 static int chan_get(lua_State *L, struct loop *lp, int idx)
 {
 	const struct zbus_channel *key = to_chan(L, idx);
+	size_t stride;
+	uint8_t *ring;
 	int ring_ref;
 	int c;
 
@@ -707,12 +726,15 @@ static int chan_get(lua_State *L, struct loop *lp, int idx)
 	}
 
 	/* Allocate before taking the record: if this raises, the record stays free. */
-	lua_newtable(L);
+	stride = ROUND_UP(MAX(zbus_chan_msg_size(key), 1U), sizeof(max_align_t));
+	ring = ring_new(L, stride, CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH);
 	ring_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
 	lp->chans[c] = (struct chan){
 		.key = key,
 		.ring_ref = ring_ref,
+		.ring = ring,
+		.stride = stride,
 		.head = 0,
 		.low = 1,
 		.depth = CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH,
@@ -721,20 +743,34 @@ static int chan_get(lua_State *L, struct loop *lp, int idx)
 	return c;
 }
 
-static void ring_trim(lua_State *L, struct chan *ch)
+/* Forgets the messages that no longer fit in depth slots. */
+static void ring_trim(struct chan *ch)
 {
 	uint32_t min = ch->head - (uint32_t)ch->depth + 1;
 
-	if ((int32_t)(min - ch->low) <= 0) {
-		return;
+	if ((int32_t)(min - ch->low) > 0) {
+		ch->low = min;
 	}
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ch->ring_ref);
-	while ((int32_t)(min - ch->low) > 0) {
-		lua_pushnil(L);
-		lua_rawseti(L, -2, (lua_Integer)ch->low);
-		ch->low++;
+}
+
+/* Moves the newest messages that fit into a ring of depth slots. */
+static void ring_resize(lua_State *L, struct chan *ch, lua_Integer depth)
+{
+	uint8_t *ring = ring_new(L, ch->stride, depth);
+	uint32_t from = ch->head - (uint32_t)depth + 1;
+
+	if ((int32_t)(from - ch->low) < 0) {
+		from = ch->low;
 	}
-	lua_pop(L, 1);
+	for (uint32_t seq = from; (int32_t)(ch->head - seq) >= 0; seq++) {
+		memcpy(ring + (size_t)(seq % (uint32_t)depth) * ch->stride, ring_slot(ch, seq),
+		       ch->stride);
+	}
+	luaL_unref(L, LUA_REGISTRYINDEX, ch->ring_ref);
+	ch->ring_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	ch->ring = ring;
+	ch->depth = (int)depth;
+	ch->low = from;
 }
 
 static void push_decoded(lua_State *L, struct loop *lp, int c, uint32_t seq)
@@ -742,24 +778,19 @@ static void push_decoded(lua_State *L, struct loop *lp, int c, uint32_t seq)
 	const struct zbus_channel *chan = lp->chans[c].key;
 	const struct lua_msg_descr *descr = zbus_chan_user_data(chan);
 	struct rx *cl = check_rx(L);
-	size_t len;
-	const char *raw;
+	size_t len = zbus_chan_msg_size(chan);
 
-	lua_rawgeti(L, LUA_REGISTRYINDEX, lp->chans[c].ring_ref);
-	lua_rawgeti(L, -1, (lua_Integer)seq);
-	raw = lua_tolstring(L, -1, &len);
-	if (raw == NULL || len != zbus_chan_msg_size(chan) || len > cl->buf_size) {
+	if (len > cl->buf_size) {
 		luaL_error(L, "async: cannot decode message on '%s'", zbus_chan_name(chan));
 	}
-	/* Lua string data may be misaligned for the struct. */
-	memcpy(cl->buf, raw, len);
-	lua_pop(L, 2);
+	/* Decode a copy: a __gc run by the decoder's allocations may resize the ring. */
+	memcpy(cl->buf, ring_slot(&lp->chans[c], seq), len);
 	STAT_INC(lp, decodes);
 	lua_msg_descr_to_table(L, descr->fields, descr->field_count, cl->buf);
 }
 
-/* The raw message is on top of L and stays there. */
-static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *key)
+/* Stores msg as the channel's newest message and wakes its waiters. */
+static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *key, const void *msg)
 {
 	int c = chan_find(lp, key);
 	struct chan *ch;
@@ -771,11 +802,8 @@ static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *ke
 	}
 	ch = &lp->chans[c];
 	ch->head++;
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ch->ring_ref);
-	lua_pushvalue(L, -2);
-	lua_rawseti(L, -2, (lua_Integer)ch->head);
-	lua_pop(L, 1);
-	ring_trim(L, ch);
+	memcpy(ring_slot(ch, ch->head), msg, zbus_chan_msg_size(key));
+	ring_trim(ch);
 
 	/* A waiter got its reader before parking. */
 	n = parked_on(lp, T_WAITING, c, order);
@@ -809,19 +837,12 @@ static void expire(lua_State *L, struct loop *lp)
 	}
 }
 
-/* Pushes the next raw message and sets *chan; 0 when none is queued. */
-static int poll(lua_State *L, const struct zbus_channel **chan)
+/* Takes the next message into the rx buffer and sets *chan; 0 when none is queued. */
+static int poll(struct rx *c, const struct zbus_channel **chan)
 {
-	struct rx *c = check_rx(L);
-
 	*chan = NULL;
-	if (zbus_sub_wait_msg(c->ctx->sub, chan, c->buf, K_NO_WAIT) != 0 || *chan == NULL) {
-		return 0;
-	}
 
-	lua_pushlstring(L, (const char *)c->buf, zbus_chan_msg_size(*chan));
-
-	return 1;
+	return zbus_sub_wait_msg(c->ctx->sub, chan, c->buf, K_NO_WAIT) == 0 && *chan != NULL;
 }
 
 static void check_locks(lua_State *L, struct loop *lp)
@@ -882,6 +903,7 @@ static void idle_wait(lua_State *L, struct loop *lp, int32_t timeout_ms)
 static bool drain(lua_State *L, struct loop *lp)
 {
 	const struct zbus_channel *key;
+	struct rx *c = check_rx(L);
 	bool hit_limit = true;
 
 	if (lp->draining) {
@@ -889,13 +911,12 @@ static bool drain(lua_State *L, struct loop *lp)
 	}
 	lp->draining = true;
 	for (int i = 0; i < CONFIG_LUA_ASYNC_MAX_DRAIN; i++) {
-		if (poll(L, &key) == 0) {
+		if (poll(c, &key) == 0) {
 			hit_limit = false;
 			break;
 		}
 		STAT_INC(lp, msgs);
-		deliver(L, lp, key);
-		lua_pop(L, 1);
+		deliver(L, lp, key, c->buf);
 	}
 	lp->draining = false;
 
@@ -1382,9 +1403,8 @@ static int l_queue_depth(lua_State *L)
 				  "queue_depth: too many channels (CONFIG_LUA_ASYNC_MAX_CHANNELS)");
 	}
 	ch = &lp->chans[c];
-	if (n > 0) {
-		ch->depth = (int)n;
-		ring_trim(L, ch);
+	if (n > 0 && n != ch->depth) {
+		ring_resize(L, ch, n);
 	}
 	lua_pushinteger(L, ch->depth);
 
