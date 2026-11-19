@@ -102,6 +102,7 @@ struct loop {
 	int rq_len;
 	int pass_left; /* tasks of the current pass still queued, at the front */
 	int ntimed;
+	int nlocking; /* tasks in T_LOCKING */
 	bool draining;
 	struct k_mem_slab *readers;
 	struct rx *rx;
@@ -415,6 +416,9 @@ static void wake(lua_State *L, struct loop *lp, int slot, int nvals)
 
 	STAT_INC(lp, wakes);
 	clear_deadline(lp, slot);
+	if (t->state == T_LOCKING) {
+		lp->nlocking--;
+	}
 	t->state = T_READY;
 	t->target = -1;
 	t->lock_chan = NULL;
@@ -561,6 +565,9 @@ static void retire(lua_State *L, struct loop *lp, int slot, uint8_t final, int r
 
 	luaL_unref(L, LUA_REGISTRYINDEX, t->co_ref);
 	free_readers(lp, t);
+	if (t->state == T_LOCKING) {
+		lp->nlocking--;
+	}
 	memset(t, 0, sizeof(*t));
 	t->state = T_FREE;
 	lp->live--;
@@ -715,6 +722,7 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 		break;
 	case KIND_LOCK:
 		t->state = T_LOCKING;
+		lp->nlocking++;
 		t->lock_chan = lua_touserdata(co, base + 2);
 		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 3));
 		break;
@@ -863,7 +871,12 @@ static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *ke
 
 static void expire(lua_State *L, struct loop *lp)
 {
-	int32_t now = uptime();
+	int32_t now;
+
+	if (lp->ntimed == 0) {
+		return;
+	}
+	now = uptime();
 
 	while (lp->ntimed > 0) {
 		int slot = lp->timed[0];
@@ -894,6 +907,9 @@ static int poll(struct rx *c, const struct zbus_channel **chan)
 
 static void check_locks(lua_State *L, struct loop *lp)
 {
+	if (lp->nlocking == 0) {
+		return;
+	}
 	STAT_ADD(lp, scans, MAX_TASKS);
 	for (int s = 0; s < MAX_TASKS; s++) {
 		struct task *t = &lp->tasks[s];
@@ -918,8 +934,10 @@ static void idle_wait(lua_State *L, struct loop *lp, int32_t timeout_ms)
 
 	k_poll_event_init(&ev[n++], K_POLL_TYPE_FIFO_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY,
 			  lp->rx->ctx->sub->message_fifo);
-	STAT_ADD(lp, scans, MAX_TASKS);
-	for (int s = 0; s < MAX_TASKS && !overflow; s++) {
+	if (lp->nlocking > 0) {
+		STAT_ADD(lp, scans, MAX_TASKS);
+	}
+	for (int s = 0; s < MAX_TASKS && !overflow && lp->nlocking > 0; s++) {
 		struct k_sem *sem;
 		int i = 1;
 
@@ -958,7 +976,8 @@ static bool drain(lua_State *L, struct loop *lp)
 	}
 	lp->draining = true;
 	for (int i = 0; i < CONFIG_LUA_ASYNC_MAX_DRAIN; i++) {
-		if (poll(c, &key) == 0) {
+		/* Lock-free peek: skips the locked get when nothing is queued. */
+		if (k_fifo_is_empty(c->ctx->sub->message_fifo) || poll(c, &key) == 0) {
 			hit_limit = false;
 			break;
 		}
