@@ -31,8 +31,8 @@
 BUILD_ASSERT(@LUAZ_COUNT@ <= CONFIG_LUA_ASYNC_MAX_TASKS,
 	     "@NAME@: more files than CONFIG_LUA_ASYNC_MAX_TASKS");
 
-static char heap_mem[CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE];
-static struct sys_heap lua_heap;
+/* A k_heap, so heap viewers such as zview find it; Lua allocates from its sys_heap. */
+K_HEAP_DEFINE(@NAME@_lua_heap, CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE);
 
 LUAZ_ASYNC_DEFINE(@NAME@_async, CONFIG_@NAME_UPPER@_LUA_ASYNC_MAX_READERS);
 
@@ -89,9 +89,7 @@ static void @NAME@_lua_thread(void *p1, void *p2, void *p3)
 
 	int n = 0;
 
-	sys_heap_init(&lua_heap, heap_mem, CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE);
-
-	lua_State *L = lua_newstate(lua_zephyr_allocator, &lua_heap, 0);
+	lua_State *L = lua_newstate(lua_zephyr_allocator, &@NAME@_lua_heap.heap, 0);
 	luaz_openlibs(L);
 
 	if (@NAME@_lua_setup(L) != 0) {
@@ -114,7 +112,7 @@ static void @NAME@_lua_thread(void *p1, void *p2, void *p3)
 
 	lua_close(L);
 
-	luaz_print_mem_usage(&lua_heap, CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE);
+	luaz_print_mem_usage(&@NAME@_lua_heap.heap, CONFIG_@NAME_UPPER@_LUA_THREAD_HEAP_SIZE);
 }
 
 K_THREAD_DEFINE(@NAME@_lua_thread_id, CONFIG_@NAME_UPPER@_LUA_THREAD_STACK_SIZE, @NAME@_lua_thread, NULL, NULL, NULL, CONFIG_@NAME_UPPER@_LUA_THREAD_PRIORITY, 0, 0);
