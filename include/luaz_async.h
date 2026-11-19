@@ -49,6 +49,8 @@ struct luaz_async_stats {
 struct luaz_async_ctx {
 	const struct zbus_observer *sub;
 	struct k_mem_slab *readers;
+	struct k_timer *timer;      /* wakes the idle scheduler at the earliest deadline */
+	struct k_poll_signal *tick; /* raised by timer */
 #ifdef CONFIG_LUA_ASYNC_STATS
 	struct luaz_async_stats *stats;
 #endif
@@ -75,7 +77,8 @@ struct luaz_async_ctx {
  * @brief Define the resources of one async thread.
  *
  * Defines the message subscriber `<_name>_sub`, the reader slab
- * `<_name>_readers` and the context `_name` to pass to luaz_async_run().
+ * `<_name>_readers`, the idle timer `<_name>_timer` with its signal
+ * `<_name>_tick`, and the context `_name` to pass to luaz_async_run().
  * With CONFIG_LUA_ASYNC_STATS it also defines `<_name>_stats`.
  *
  * @param _name         Context name.
@@ -88,9 +91,13 @@ struct luaz_async_ctx {
 	K_MEM_SLAB_DEFINE_STATIC(_name##_readers, sizeof(struct luaz_async_reader),                \
 				 LUAZ_ASYNC_READERS(_max_readers), sizeof(void *));                \
 	Z_LUAZ_ASYNC_STATS_DEFINE(_name);                                                          \
+	static struct k_timer _name##_timer;                                                       \
+	static struct k_poll_signal _name##_tick;                                                  \
 	static const struct luaz_async_ctx _name = {                                               \
 		.sub = &_name##_sub,                                                               \
 		.readers = &_name##_readers,                                                       \
+		.timer = &_name##_timer,                                                           \
+		.tick = &_name##_tick,                                                             \
 		Z_LUAZ_ASYNC_STATS_INIT(_name)                                                     \
 	}
 /* clang-format on */

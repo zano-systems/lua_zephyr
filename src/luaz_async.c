@@ -104,7 +104,9 @@ struct loop {
 	int rq_len;
 	int pass_left; /* tasks of the current pass still queued, at the front */
 	int ntimed;
-	int nlocking; /* tasks in T_LOCKING */
+	int nlocking;           /* tasks in T_LOCKING */
+	int32_t timer_deadline; /* when timer_armed: the deadline the idle timer fires at */
+	bool timer_armed;
 	bool draining;
 	struct k_mem_slab *readers;
 	struct rx *rx;
@@ -934,26 +936,67 @@ static void check_locks(lua_State *L, struct loop *lp)
 	}
 }
 
-/*
- * Sleeps until a message is queued, a lock a task waits for is free, or the
- * timeout. One event per distinct lock, up to MAX_LOCKS: beyond that the wait
- * is cut to one tick, so check_locks() sees the other locks within a tick.
- */
-static void idle_wait(lua_State *L, struct loop *lp, int32_t timeout_ms)
+static void timer_expired(struct k_timer *timer)
 {
-	struct k_poll_event ev[1 + MAX_LOCKS];
-	k_timeout_t timeout = timeout_ms < 0 ? K_FOREVER : K_MSEC(timeout_ms);
+	k_poll_signal_raise(k_timer_user_data_get(timer), 0);
+}
+
+/*
+ * Keeps the idle timer at or before the earliest deadline. It is re-armed
+ * only when that deadline moves earlier: when it moves later (a task re-parks
+ * with a new timeout), the timer fires early once and is re-armed then, so
+ * timed awaits do not arm and cancel a kernel timeout on every message.
+ * Returns true when the earliest deadline has already passed.
+ */
+static bool timer_due(struct loop *lp)
+{
+	int32_t deadline;
+	int32_t left;
+
+	if (lp->ntimed == 0) {
+		return false; /* an armed timer just causes one spurious pass */
+	}
+	deadline = lp->tasks[lp->timed[0]].deadline;
+	if (lp->timer_armed && (int32_t)((uint32_t)deadline - (uint32_t)lp->timer_deadline) >= 0) {
+		return false;
+	}
+	left = (int32_t)((uint32_t)deadline - (uint32_t)uptime());
+	if (left <= 0) {
+		return true;
+	}
+	k_timer_start(lp->rx->ctx->timer, K_MSEC(left), K_NO_WAIT);
+	lp->timer_armed = true;
+	lp->timer_deadline = deadline;
+
+	return false;
+}
+
+/*
+ * Sleeps until a message is queued, the idle timer fires, or a lock a task
+ * waits for is free. One event per distinct lock, up to MAX_LOCKS: beyond
+ * that the wait is cut to one tick, so check_locks() sees the other locks
+ * within a tick.
+ */
+static void idle_wait(lua_State *L, struct loop *lp)
+{
+	struct k_poll_event ev[2 + MAX_LOCKS];
+	struct k_poll_signal *tick = lp->rx->ctx->tick;
+	k_timeout_t timeout = K_FOREVER;
+	unsigned int signaled;
 	bool overflow = false;
+	int result;
 	int n = 0;
 
+	ARG_UNUSED(L);
 	k_poll_event_init(&ev[n++], K_POLL_TYPE_FIFO_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY,
 			  lp->rx->ctx->sub->message_fifo);
+	k_poll_event_init(&ev[n++], K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, tick);
 	if (lp->nlocking > 0) {
 		STAT_ADD(lp, scans, MAX_TASKS);
 	}
 	for (int s = 0; s < MAX_TASKS && !overflow && lp->nlocking > 0; s++) {
 		struct k_sem *sem;
-		int i = 1;
+		int i = 2;
 
 		if (lp->tasks[s].state != T_LOCKING) {
 			continue;
@@ -972,10 +1015,16 @@ static void idle_wait(lua_State *L, struct loop *lp, int32_t timeout_ms)
 					  K_POLL_MODE_NOTIFY_ONLY, sem);
 		}
 	}
-	if (overflow && (timeout_ms < 0 || k_ms_to_ticks_ceil32((uint32_t)timeout_ms) > 1)) {
+	if (overflow) {
 		timeout = K_TICKS(1);
 	}
 	(void)k_poll(ev, n, timeout);
+
+	k_poll_signal_check(tick, &signaled, &result);
+	if (signaled != 0U) {
+		k_poll_signal_reset(tick);
+		lp->timer_armed = false;
+	}
 }
 
 /* True when more messages may be queued. Not reentered from a __gc that awaits. */
@@ -1030,19 +1079,10 @@ static int loop_body(lua_State *L)
 			run_task(L, lp, dequeue(lp));
 		}
 
-		if (lp->live > 0 && lp->rq_len == 0 && !hit_limit) {
-			int32_t timeout = -1;
-
-			if (lp->ntimed > 0) {
-				timeout = (int32_t)((uint32_t)lp->tasks[lp->timed[0]].deadline -
-						    (uint32_t)uptime());
-				if (timeout < 0) {
-					timeout = 0;
-				}
-			}
+		if (lp->live > 0 && lp->rq_len == 0 && !hit_limit && !timer_due(lp)) {
 			STAT_INC(lp, idle_waits);
 			STAT_T0(t_idle);
-			idle_wait(L, lp, timeout);
+			idle_wait(L, lp);
 			STAT_CYC(lp, cyc_idle, t_idle);
 		}
 	}
@@ -1787,6 +1827,15 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	zbus_iterate_over_channels_with_user_data(unwatch_now, (void *)sub);
 	(void)zbus_obs_set_enable(sub, true);
 
+	/* The idle timer is static, so a faulting run cannot leave it dangling. A nested
+	 * call (refused by l_run) must not touch the running scheduler's timer.
+	 */
+	if (outer == NULL) {
+		k_timer_init(ctx->timer, timer_expired, NULL);
+		k_timer_user_data_set(ctx->timer, ctx->tick);
+		k_poll_signal_init(ctx->tick);
+	}
+
 	lua_pushcfunction(L, l_run);
 	lua_insert(L, fn_idx); /* l_run, f1 ... fn: the call consumes the functions */
 	if (lua_pcall(L, n, 1, 0) != LUA_OK) {
@@ -1813,6 +1862,9 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 
 	/* Leave the subscriber clean for the next run, even after a fault. */
 	while (zbus_sub_wait_msg(sub, &chan, c->buf, K_NO_WAIT) == 0) {
+	}
+	if (outer == NULL) {
+		k_timer_stop(ctx->timer);
 	}
 	lua_pushnil(L);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &rx_key);
