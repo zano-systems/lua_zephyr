@@ -1076,7 +1076,11 @@ static bool drain(lua_State *L, struct loop *lp)
 	lp->draining = true;
 	for (int i = 0; i < CONFIG_LUA_ASYNC_MAX_DRAIN; i++) {
 		/* Lock-free peek: skips the locked get when nothing is queued. */
-		if (k_fifo_is_empty(c->ctx->sub->message_fifo) || poll(c, &key) == 0) {
+		if (k_fifo_is_empty(c->ctx->sub->message_fifo)) {
+			hit_limit = false;
+			break;
+		}
+		if (poll(c, &key) == 0) {
 			hit_limit = false;
 			break;
 		}
