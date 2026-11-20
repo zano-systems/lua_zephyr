@@ -187,6 +187,7 @@ struct handle {
  */
 struct anchor {
 	struct loop *lp;
+	const struct anchor *self; /* checked before use: see up_loop() */
 };
 
 /* Returns the state's anchor, creating it on first use (may raise). */
@@ -202,6 +203,7 @@ static struct anchor *anchor_get(lua_State *L)
 	lua_pop(L, 1);
 	a = lua_newuserdatauv(L, sizeof(*a), 0);
 	a->lp = NULL;
+	a->self = a;
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &anchor_key);
 
 	return a;
@@ -222,7 +224,19 @@ static struct anchor *anchor_find(lua_State *L)
 /* The running loop as seen from a binding (a C closure with the anchor upvalue). */
 static struct loop *up_loop(lua_State *L)
 {
-	return ((const struct anchor *)lua_touserdata(L, lua_upvalueindex(1)))->lp;
+	const int up = lua_upvalueindex(1);
+	const struct anchor *a = lua_touserdata(L, up);
+
+	/*
+	 * Only the debug library can replace a C closure's upvalue; fail instead
+	 * of reading another object as the anchor. (A script with the debug
+	 * library can break memory safety in other ways: see LUA_LIB_DEBUG.)
+	 */
+	if (a == NULL || lua_rawlen(L, up) != sizeof(*a) || a->self != a) {
+		luaL_error(L, "async: binding upvalue was replaced");
+	}
+
+	return a->lp;
 }
 
 static struct loop *get_loop(lua_State *L)
@@ -274,7 +288,7 @@ static const struct zbus_channel *to_chan(lua_State *L, int idx)
 	const struct zbus_channel **ud = lua_touserdata(L, idx);
 	bool ok;
 
-	if (ud == NULL || lua_getmetatable(L, idx) == 0) {
+	if (ud == NULL || lua_rawlen(L, idx) != sizeof(*ud) || lua_getmetatable(L, idx) == 0) {
 		return NULL;
 	}
 	ok = lua_rawequal(L, -1, lua_upvalueindex(2));
@@ -1222,9 +1236,8 @@ static int l_run(lua_State *L)
  * yield, nothing is recorded and the caller's lua_yield raises its usual
  * error, so a request is only ever left behind by a real yield.
  */
-static void set_request(lua_State *L, int kind, int target, int32_t ms)
+static void set_request(lua_State *L, struct loop *lp, int kind, int target, int32_t ms)
 {
-	struct loop *lp = up_loop(L);
 	struct task *t = &lp->tasks[lp->current];
 
 	/* From a nested coroutine the yield would reach its resumer, not the scheduler. */
@@ -1239,9 +1252,10 @@ static void set_request(lua_State *L, int kind, int target, int32_t ms)
 	t->req_ms = ms;
 }
 
-static int request(lua_State *L, int kind, int target, int32_t ms)
+/* lp comes from the binding's single up_loop() call, already checked by cur_slot(). */
+static int request(lua_State *L, struct loop *lp, int kind, int target, int32_t ms)
 {
-	set_request(L, kind, target, ms);
+	set_request(L, lp, kind, target, ms);
 
 	return lua_yield(L, 0);
 }
@@ -1279,19 +1293,23 @@ static int l_sleep(lua_State *L)
 {
 	int32_t ms = check_timeout(L, 1, "async.sleep", false);
 
-	(void)cur_slot(L, up_loop(L));
+	struct loop *lp = up_loop(L);
+
+	(void)cur_slot(L, lp);
 	if (ms == 0) {
-		return request(L, KIND_YIELD, -1, 0);
+		return request(L, lp, KIND_YIELD, -1, 0);
 	}
 
-	return request(L, KIND_SLEEP, -1, ms);
+	return request(L, lp, KIND_SLEEP, -1, ms);
 }
 
 static int l_yield(lua_State *L)
 {
-	(void)cur_slot(L, up_loop(L));
+	struct loop *lp = up_loop(L);
 
-	return request(L, KIND_YIELD, -1, 0);
+	(void)cur_slot(L, lp);
+
+	return request(L, lp, KIND_YIELD, -1, 0);
 }
 
 static struct handle *check_handle(lua_State *L)
@@ -1335,7 +1353,7 @@ static int l_join(lua_State *L)
 		return 2;
 	}
 
-	return request(L, KIND_JOIN, h->slot, ms);
+	return request(L, lp, KIND_JOIN, h->slot, ms);
 }
 
 static int l_cancel(lua_State *L)
@@ -1414,8 +1432,10 @@ static int32_t time_left(lua_State *L, int idx)
 static int park_on_lock(lua_State *L, const struct zbus_channel *chan, int32_t left,
 			lua_KContext ctx, lua_KFunction k)
 {
-	set_request(L, KIND_LOCK, -1, left);
-	up_loop(L)->tasks[up_loop(L)->current].lock_chan = chan;
+	struct loop *lp = up_loop(L);
+
+	set_request(L, lp, KIND_LOCK, -1, left);
+	lp->tasks[lp->current].lock_chan = chan;
 
 	return lua_yieldk(L, 0, ctx, k);
 }
@@ -1493,7 +1513,7 @@ static int await_try(lua_State *L)
 			return 1;
 		}
 		if (left != 0) {
-			return request(L, KIND_AWAIT, c, left);
+			return request(L, lp, KIND_AWAIT, c, left);
 		}
 		if (drained) {
 			break;

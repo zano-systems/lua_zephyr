@@ -114,4 +114,24 @@ return {
 		T.eq(#F.reports, 1)
 		T.matches(F.reports[1], "^async: scheduler already running")
 	end },
+
+	{ "a binding with a replaced upvalue raises instead of misreading it", function(T)
+		local async = T.start()
+		local yield = async.yield
+		local _, anchor = debug.getupvalue(yield, 1)
+		local errs = {}
+		async._run(function()
+			local h = async.spawn(function() end) -- a userdata of another type
+			for _, fake in ipairs({ {}, h }) do
+				debug.setupvalue(yield, 1, fake)
+				local ok, err = pcall(yield)
+				debug.setupvalue(yield, 1, anchor)
+				errs[#errs + 1] = (not ok) and err or "no error"
+			end
+		end)
+		T.eq(#errs, 2)
+		for _, e in ipairs(errs) do
+			T.matches(e, "binding upvalue was replaced")
+		end
+	end },
 }

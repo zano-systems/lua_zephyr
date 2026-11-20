@@ -101,6 +101,11 @@ config LUA_LIB_DEBUG
     help
       Preload the Lua debug library.
 
+      The debug library lets a script replace upvalues and metatables of
+      C objects (debug.setupvalue, debug.setmetatable), which can make a
+      C binding read one object as another. Leave it disabled in builds
+      that run untrusted scripts; LUA_LIBS_ALL enables it.
+
 config LUA_LIB_ZBUS
     bool "Lua zbus library"
     default y if LUA_LIBS_ALL

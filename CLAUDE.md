@@ -159,7 +159,7 @@ Deeper nesting (3+ levels) works the same way — always define leaf types first
 | `CONFIG_LUA_LIB_MATH`            | if ALL   | Lua math library                                                   |
 | `CONFIG_LUA_LIB_COROUTINE`       | if ALL   | Lua coroutine library                                              |
 | `CONFIG_LUA_LIB_UTF8`            | if ALL   | Lua utf8 library                                                   |
-| `CONFIG_LUA_LIB_DEBUG`           | if ALL   | Lua debug library                                                  |
+| `CONFIG_LUA_LIB_DEBUG`           | if ALL   | Lua debug library (lets scripts forge C objects: keep off for untrusted scripts) |
 | `CONFIG_LUA_LIB_ZBUS`            | if ALL   | Include zbus bindings as `zephyr.zbus` subtable                    |
 | `CONFIG_LUA_PRECOMPILE`          | `n`      | Precompile scripts to bytecode at build time                       |
 | `CONFIG_LUA_PRECOMPILE_ONLY`     | `n`      | Exclude Lua parser (~15-20 KB savings)                             |
