@@ -41,7 +41,7 @@ The `zephyr.async` scheduler has its own suite in `tests/async` (`testcase.yaml`
 west twister -p native_sim -T tests -O /tmp/lua_tests_native/
 ```
 
-Scheduler benchmarks live in `tests/async_bench` (cycles/op, allocs/op, heap peak; `.breakdown` adds the phase split). Run `just bench-device` (board in `hardware_map.yaml`; DWT cycles) or `just bench` (QEMU, counts only), and compare two logs with `scripts/bench_table.py`. `CONFIG_BENCH_PROFILE="<case>"` + `scripts/pc_sample.py` gives a function-level profile over J-Link. On boards with `tests/async_bench/baselines/<board>.lua` (nRF52833 only), a case more than `CONFIG_BENCH_MARGIN_PCT` (10%) slower than its baseline fails the run; refresh it with `bench_table.py --emit-baseline <log>` after an intended change. Results and method: `docs/async_perf.md`.
+Scheduler benchmarks live in `tests/async_bench` (cycles/op, allocs/op, heap peak; `.breakdown` adds the phase split). Run `just bench-device` (board in `hardware_map.yaml`; DWT cycles) or `just bench` (QEMU, counts only), and compare two logs with `scripts/bench_table.py`. `CONFIG_BENCH_PROFILE="<case>"` + `scripts/pc_sample.py` gives a function-level profile over J-Link. On boards with `tests/async_bench/baselines/<board>.lua` (nRF52833 only), a case more than `CONFIG_BENCH_MARGIN_PCT` (10%) slower than its baseline fails the run; refresh it with `bench_table.py --emit-baseline <log>` after an intended change.
 
 ### Formatting
 
