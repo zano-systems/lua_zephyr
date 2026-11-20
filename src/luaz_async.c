@@ -584,7 +584,11 @@ static int new_task(lua_State *L, struct loop *lp, int nargs)
 
 	memset(t, 0, sizeof(*t));
 #if CONFIG_LUA_ASYNC_CORO_POOL > 0
-	if (lp->npool > 0) {
+	/*
+	 * lua_newthread() copies the spawner's hook (the C hook and its mask), which a
+	 * pooled coroutine would not have: with a hook set, create the coroutine fresh.
+	 */
+	if (lp->npool > 0 && lua_gethook(L) == NULL) {
 		co = lp->pool[lp->npool - 1].co;
 		/* Raise before the slot or the pooled coroutine is taken. */
 		if (lua_checkstack(co, nargs + 1) == 0) {
@@ -635,8 +639,9 @@ static void detach(struct loop *lp, int slot)
 static void release_co(lua_State *L, struct loop *lp, struct task *t, bool initial)
 {
 #if CONFIG_LUA_ASYNC_CORO_POOL > 0
-	if (!initial && t->escaped == 0U && lp->npool < CONFIG_LUA_ASYNC_CORO_POOL &&
-	    lua_closethread(t->co, L) == LUA_OK) {
+	/* A hook set on the coroutine survives lua_closethread(): never pool one. */
+	if (!initial && t->escaped == 0U && lua_gethook(t->co) == NULL &&
+	    lp->npool < CONFIG_LUA_ASYNC_CORO_POOL && lua_closethread(t->co, L) == LUA_OK) {
 		lp->pool[lp->npool].co = t->co;
 		lp->pool[lp->npool].ref = t->co_ref;
 		lp->npool++;
@@ -1884,9 +1889,17 @@ int luaz_async_coroutine_running(lua_State *L)
 	struct loop *lp = get_loop(L);
 	int ismain = lua_pushthread(L);
 
-	/* Only the task's own coroutine escapes; a nested one is never pooled anyway. */
-	if (lp != NULL && lp->current >= 0 && lp->tasks[lp->current].co == L) {
-		lp->tasks[lp->current].escaped = 1U;
+	/*
+	 * Mark the task that owns the calling coroutine, which is not always the
+	 * current one: a cancelled or failed task's __close handlers run on its
+	 * coroutine while another task (or none) is current. A nested coroutine
+	 * belongs to no task and is never pooled anyway.
+	 */
+	for (int s = 0; lp != NULL && s < MAX_TASKS; s++) {
+		if (lp->tasks[s].state != T_FREE && lp->tasks[s].co == L) {
+			lp->tasks[s].escaped = 1U;
+			break;
+		}
 	}
 	lua_pushboolean(L, ismain);
 

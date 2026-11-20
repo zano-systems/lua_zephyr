@@ -261,4 +261,73 @@ return {
 		T.eq(closed.normal, 1, "the finished task's <close> ran once")
 		T.eq(closed.fresh, 3, "each new task ran only its own <close>")
 	end },
+
+	{ "a coroutine saved by a cancelled or failed task's <close> is never reused", function(T)
+		local async = T.start()
+		local status = {}
+		local function saver(name)
+			return setmetatable({}, { __close = function() status[name] = coroutine.running() end })
+		end
+		-- With the saved coroutine reused, a parked task would make it "suspended".
+		local function parked_status(name)
+			local next_task = async.spawn(function() async.sleep(20) end)
+			async.yield() -- next_task is parked now
+			local st = coroutine.status(status[name])
+			next_task:join()
+			return st
+		end
+		local results = {}
+		async._run(function()
+			local victim = async.spawn(function()
+				local c <close> = saver("cancelled")
+				async.sleep(100)
+			end)
+			async.yield()
+			victim:cancel() -- its <close> runs on its coroutine while this task is current
+			results.cancelled = parked_status("cancelled")
+			async.spawn(function()
+				local c <close> = saver("failed")
+				error("x", 0) -- its <close> runs after the task ended, with no task current
+			end):join()
+			results.failed = parked_status("failed")
+		end)
+		T.eq(results.cancelled, "dead", "coroutine saved during a cancel")
+		T.eq(results.failed, "dead", "coroutine saved during a failure")
+	end },
+
+	{ "debug hooks do not cross coroutine reuse", function(T)
+		local async = T.start()
+		local counts = { a = 0 }
+		local leaked, fresh_mask, child_mask
+		async._run(function()
+			-- A task that ends with a hook still set on its coroutine.
+			async.spawn(function()
+				debug.sethook(function() counts.a = counts.a + 1 end, "l")
+				local x = 1
+				x = x + 1
+			end):join()
+			local before = counts.a
+			async.spawn(function()
+				local y = 1
+				y = y + 1
+				y = y + 1
+			end):join()
+			leaked = counts.a - before
+		end)
+		-- A new run starts with an empty pool. A spawner with a hook: the new task
+		-- must start with the same hook state as a fresh coroutine (the C hook
+		-- and mask are inherited).
+		async._run(function()
+			async.spawn(function() end):join() -- leaves a clean coroutine in the pool
+			debug.sethook(function() end, "l")
+			local fresh = coroutine.create(function() return select(2, debug.gethook()) end)
+			fresh_mask = select(2, coroutine.resume(fresh))
+			local child = async.spawn(function() child_mask = select(2, debug.gethook()) end)
+			debug.sethook()
+			child:join()
+		end)
+		T.eq(leaked, 0, "a hook set by one task did not fire in the next")
+		T.eq(fresh_mask, "l")
+		T.eq(child_mask, fresh_mask, "a task spawned under a hook starts like a fresh coroutine")
+	end },
 }
