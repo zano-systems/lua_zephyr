@@ -107,30 +107,52 @@ local function await_multi(nchans, nmsg)
 end
 
 -- Lock path without contention: pub_async / read_async on an unwatched channel.
+-- Every result is checked (one comparison per op), so a fast failure cannot
+-- pass for a speedup.
 local function lock_bench(n)
 	local ch = chans[4]
+	local bad = 0
 	bench.measure("pub_async", n, function()
 		local msg = { seq = 0, a = 1, b = 2, c = 3 }
 		for i = 1, n do
 			msg.seq = i
-			ch:pub_async(msg)
+			if ch:pub_async(msg) ~= true then
+				bad = bad + 1
+			end
 		end
 	end)
+	if bad > 0 then
+		bench.fail("pub_async: " .. bad .. " publishes failed")
+	end
+	bad = 0
 	bench.measure("read_async", n, function()
 		for _ = 1, n do
-			ch:read_async()
+			local m = ch:read_async()
+			if m == nil or m.seq ~= n then
+				bad = bad + 1
+			end
 		end
 	end)
+	if bad > 0 then
+		bench.fail("read_async: " .. bad .. " reads failed or returned the wrong message")
+	end
 end
 
 -- Task churn: spawn + join one short task at a time.
 local function spawn_bench(n)
+	local bad = 0
 	bench.measure("spawn_join", n, function()
 		local id = function(x) return x end
 		for i = 1, n do
-			async.spawn(id, i):join()
+			local ok, v = async.spawn(id, i):join()
+			if ok ~= true or v ~= i then
+				bad = bad + 1
+			end
 		end
 	end)
+	if bad > 0 then
+		bench.fail("spawn_join: " .. bad .. " joins failed")
+	end
 end
 
 repeat
