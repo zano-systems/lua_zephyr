@@ -28,17 +28,17 @@ instrumentation added and disabled.
 
 | bench | baseline | now | Δ | allocs/op |
 |---|---:|---:|---:|---|
-| yield/2 | 2694 | 1260 | −53% | 0.00 → 0.00 |
-| yield/8 | 2281 | 1224 | −46% | 0.03 → 0.01 |
-| yield/32 | 2288 | 1290 | −44% | 0.11 → 0.06 |
-| sleep/16 | 5385 | 3402 | −37% | 0.71 → 0.41 |
-| await_fanout/1 (per delivery) | 28996 | 12742 | −56% | 5.12 → 2.06 |
-| await_fanout/4 | 23919 | 10631 | −56% | 4.30 → 2.03 |
-| await_fanout/8 | 22405 | 10616 | −53% | 4.17 → 2.02 |
-| await_multi/4 | 31035 | 13565 | −56% | 5.17 → 2.06 |
-| pub_async | 9076 | 7926 | −13% | 1.02 → 1.01 |
-| read_async | 17267 | 9214 | −47% | 5.02 → 3.01 |
-| spawn_join | 23825 | 22801 | −4% | 7.05 → 7.04 |
+| yield/2 | 2694 | 1298 | −52% | 0.00 → 0.00 |
+| yield/8 | 2281 | 1271 | −44% | 0.03 → 0.01 |
+| yield/32 | 2288 | 1335 | −42% | 0.11 → 0.06 |
+| sleep/16 | 5385 | 3560 | −34% | 0.71 → 0.41 |
+| await_fanout/1 (per delivery) | 28996 | 13140 | −55% | 5.12 → 2.06 |
+| await_fanout/4 | 23919 | 11014 | −54% | 4.30 → 2.03 |
+| await_fanout/8 | 22405 | 10972 | −51% | 4.17 → 2.02 |
+| await_multi/4 | 31035 | 14037 | −55% | 5.17 → 2.06 |
+| pub_async | 9076 | 8314 | −8% | 1.02 → 1.01 |
+| read_async | 17267 | 9840 | −43% | 5.02 → 3.01 |
+| spawn_join | 23825 | 25286 | +6% | 7.05 → 7.04 |
 
 Incremental GC. Generational GC gives the same cycle counts within a few
 percent.
@@ -54,6 +54,23 @@ percent.
 | `perf(async): resolve channels against an upvalue metatable` | No `luaL_testudata` name lookup, 2 instead of 3 per await: awaits −11 to −14% |
 | `perf(async): pass park requests through the task record` | No tag/kind/args on the coroutine stack: yield −19 to −22%, sleep −18% |
 | `perf(async): keep one lazily re-armed idle timer` | No kernel timeout added and aborted per idle wait: sleep −5%, timed awaits −1 to −3% |
+
+### Review fixes
+
+These came from the review of #25. Each one has a regression test.
+
+| Commit | Fix | Cost |
+|---|---|---|
+| `fix(async): refuse a nested run before touching the running one` | A nested `luaz_async_run()` replaced the running scheduler's rx and channel registrations (use-after-free) | none |
+| `fix(async): initialize the idle timer once` | Calling `k_timer_init()` on every run re-linked the timer into the kernel's object list (Zephyr v4.4.2) | none |
+| `fix(async): track the ring's write slot across sequence wrap` | `seq % depth` aliased live slots at 32-bit wrap | within noise |
+| `fix(async): pair timing_start with timing_stop, report live totals` | `timing_start()` was never paired with `timing_stop()`; `async.stats()` read `cyc_total` as 0 | stats builds only |
+| `test(async): check benchmark results, not just their timing` | pub/read/join results were discarded | read_async +4%, spawn_join +11% (one check per op) |
+| `fix(async): fail safely when a binding's upvalue is replaced` | A forged anchor or metatable upvalue (debug library) now raises instead of being misread | yield +3%, awaits +1–3% |
+
+Scenarios added to `tests/async`: `obj_core` (the idle timer is registered
+once), `seq_wrap` (the whole suite runs with sequence numbers starting just
+below the 32-bit wrap) and `stats` (live totals, allocator counters).
 
 ## Where the time goes now
 
