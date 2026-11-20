@@ -21,3 +21,10 @@ tests:
   lua_zephyr.async_bench.only_read:
     extra_configs:
       - CONFIG_BENCH_ONLY="read_async"
+    harness_config:
+      type: multi_line
+      ordered: true
+      regex:
+        - "BENCH read_async .* gc=inc"
+        - "BENCH read_async .* gc=gen"
+        - "bench done: 0 failed"

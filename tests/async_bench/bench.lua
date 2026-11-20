@@ -58,13 +58,29 @@ end
 
 -- CONFIG_BENCH_ONLY runs one case once; CONFIG_BENCH_PROFILE runs one case
 -- forever, without output, for PC sampling.
+-- A selection skips whole cases, setup included; within a case that measures
+-- several names (lock_bench), only the selected one is measured.
 local PROFILE = bench.profile
 local ONLY = PROFILE ~= "" and PROFILE or bench.only
+local matched = 0
 if ONLY ~= "" then
 	local measure = bench.measure
 	bench.measure = function(name, ...)
 		if name == ONLY then
+			matched = matched + 1
 			return measure(name, ...)
+		end
+	end
+end
+
+-- Runs a case whose measurements are named names, unless a selection excludes it.
+local function case(names, fn, ...)
+	if ONLY == "" then
+		return fn(...)
+	end
+	for _, name in ipairs(names) do
+		if name == ONLY then
+			return fn(...)
 		end
 	end
 end
@@ -230,16 +246,21 @@ end
 repeat
 	for _, mode in ipairs({ "inc", "gen" }) do
 		bench.gc(mode)
-		yield_bench(2, 1000)
-		yield_bench(8, 250)
-		yield_bench(32, 64)
-		sleep_bench(16, 10)
-		await_fanout(1, 200)
-		await_fanout(4, 200)
-		await_fanout(8, 200)
-		await_multi(4, 400)
-		lock_bench(500)
-		spawn_bench(200)
+		case({ "yield/2" }, yield_bench, 2, 1000)
+		case({ "yield/8" }, yield_bench, 8, 250)
+		case({ "yield/32" }, yield_bench, 32, 64)
+		case({ "sleep/16" }, sleep_bench, 16, 10)
+		case({ "await_fanout/1" }, await_fanout, 1, 200)
+		case({ "await_fanout/4" }, await_fanout, 4, 200)
+		case({ "await_fanout/8" }, await_fanout, 8, 200)
+		case({ "await_multi/4" }, await_multi, 4, 400)
+		case({ "pub_async", "read_async" }, lock_bench, 500)
+		case({ "spawn_join" }, spawn_bench, 200)
+	end
+	-- A selection that matches nothing would otherwise pass without measuring.
+	if ONLY ~= "" and matched == 0 then
+		bench.fail("CONFIG_BENCH_ONLY / CONFIG_BENCH_PROFILE \"" .. ONLY .. "\" matches no case")
+		break
 	end
 until PROFILE == ""
 
