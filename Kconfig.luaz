@@ -216,6 +216,19 @@ config LUA_ASYNC_THREAD_STACK_SIZE
     help
       Default stack size of threads with CONFIG_<NAME>_LUA_THREAD_ASYNC=y.
 
+config LUA_ASYNC_CORO_POOL
+    int "Finished task coroutines kept for reuse per async thread"
+    range 0 256
+    default 2
+    help
+      async.spawn reuses the coroutine of a finished task (reset with
+      lua_closethread) instead of creating one, which saves about 0.5 KB
+      of allocation and GC work per spawn. Each pooled coroutine stays
+      allocated until the run ends. A task that called
+      coroutine.running() is never pooled, so a stored reference never
+      aliases a later task; initial tasks are not pooled either. 0
+      disables the pool.
+
 config LUA_ASYNC_STATS
     bool "Scheduler counters and per-phase cycle accounting"
     imply TIMING_FUNCTIONS

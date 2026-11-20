@@ -87,7 +87,8 @@ struct task {
 	int16_t req_target;                   /* request: channel or task */
 	uint8_t state;
 	uint8_t has_deadline;
-	uint8_t req; /* KIND_* set by the parking call, 0 for none */
+	uint8_t req;     /* KIND_* set by the parking call, 0 for none */
+	uint8_t escaped; /* called coroutine.running(): never pooled */
 };
 
 struct chan {
@@ -173,6 +174,13 @@ struct loop {
 	struct chan chans[MAX_CHANS];
 	int16_t runq[MAX_TASKS];
 	int16_t timed[MAX_TASKS];
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	int npool;
+	struct {
+		lua_State *co; /* reset with lua_closethread() */
+		int ref;       /* registry ref keeping it alive */
+	} pool[CONFIG_LUA_ASYNC_CORO_POOL];
+#endif
 };
 
 struct handle {
@@ -575,12 +583,28 @@ static int new_task(lua_State *L, struct loop *lp, int nargs)
 	lua_State *co;
 
 	memset(t, 0, sizeof(*t));
-	co = lua_newthread(L);
-	/* Raise before the slot is taken: a new coroutine only guarantees LUA_MINSTACK slots. */
-	if (lua_checkstack(co, nargs + 1) == 0) {
-		return luaL_error(L, "async.spawn: too many arguments (%d)", nargs);
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	if (lp->npool > 0) {
+		co = lp->pool[lp->npool - 1].co;
+		/* Raise before the slot or the pooled coroutine is taken. */
+		if (lua_checkstack(co, nargs + 1) == 0) {
+			return luaL_error(L, "async.spawn: too many arguments (%d)", nargs);
+		}
+		lp->npool--;
+		STAT_INC(lp, co_reuses);
+		t->co_ref = lp->pool[lp->npool].ref;
+	} else
+#endif
+	{
+		co = lua_newthread(L);
+		/* Raise before the slot is taken: a new coroutine only guarantees LUA_MINSTACK
+		 * slots.
+		 */
+		if (lua_checkstack(co, nargs + 1) == 0) {
+			return luaL_error(L, "async.spawn: too many arguments (%d)", nargs);
+		}
+		t->co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	}
-	t->co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	t->co = co;
 	lua_xmove(L, co, nargs + 1);
 	t->nreply = nargs;
@@ -603,10 +627,33 @@ static void detach(struct loop *lp, int slot)
 	clear_deadline(lp, slot);
 }
 
+/*
+ * Keeps a finished task's coroutine for the next spawn when it is safe to:
+ * not an initial task, never exposed through coroutine.running(), room in the
+ * pool, and a clean reset. Otherwise it is dropped for the GC.
+ */
+static void release_co(lua_State *L, struct loop *lp, struct task *t, bool initial)
+{
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	if (!initial && t->escaped == 0U && lp->npool < CONFIG_LUA_ASYNC_CORO_POOL &&
+	    lua_closethread(t->co, L) == LUA_OK) {
+		lp->pool[lp->npool].co = t->co;
+		lp->pool[lp->npool].ref = t->co_ref;
+		lp->npool++;
+		return;
+	}
+#else
+	ARG_UNUSED(lp);
+	ARG_UNUSED(initial);
+#endif
+	luaL_unref(L, LUA_REGISTRYINDEX, t->co_ref);
+}
+
 /* The handle keeps the outcome, so it stays valid after the slot is reused. */
 static void retire(lua_State *L, struct loop *lp, int slot, uint8_t final, int ridx)
 {
 	struct task *t = &lp->tasks[slot];
+	bool initial = (t->handle_ref == LUA_NOREF);
 
 	ridx = lua_absindex(L, ridx);
 	if (t->handle_ref != LUA_NOREF) {
@@ -621,7 +668,7 @@ static void retire(lua_State *L, struct loop *lp, int slot, uint8_t final, int r
 		luaL_unref(L, LUA_REGISTRYINDEX, t->handle_ref);
 	}
 
-	luaL_unref(L, LUA_REGISTRYINDEX, t->co_ref);
+	release_co(L, lp, t, initial);
 	free_readers(lp, t);
 	if (t->state == T_LOCKING) {
 		lp->nlocking--;
@@ -1249,6 +1296,12 @@ static int l_run(lua_State *L)
 			ch->key = NULL;
 		}
 	}
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	for (int i = 0; i < lp->npool; i++) {
+		luaL_unref(L, LUA_REGISTRYINDEX, lp->pool[i].ref);
+	}
+	lp->npool = 0;
+#endif
 	lua_pushnil(L);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &loop_key);
 	anchor->lp = NULL;
@@ -1752,7 +1805,7 @@ static int l_stats(lua_State *L)
 	lp->stats->cyc_total = stat_since(lp->run_t0);
 	st = lp->stats;
 
-	lua_createtable(L, 0, 14);
+	lua_createtable(L, 0, 15);
 #define STAT_FIELD(_f)                                                                             \
 	lua_pushinteger(L, (lua_Integer)st->_f);                                                   \
 	lua_setfield(L, -2, #_f)
@@ -1763,6 +1816,7 @@ static int l_stats(lua_State *L)
 	STAT_FIELD(msgs);
 	STAT_FIELD(decodes);
 	STAT_FIELD(scans);
+	STAT_FIELD(co_reuses);
 	STAT_FIELD(cyc_hz);
 	STAT_FIELD(cyc_total);
 	STAT_FIELD(cyc_resume);
@@ -1823,6 +1877,20 @@ static int luaz_async_open(lua_State *L)
 	luaL_setfuncs(L, module_funcs, 1);
 
 	return 1;
+}
+
+int luaz_async_coroutine_running(lua_State *L)
+{
+	struct loop *lp = get_loop(L);
+	int ismain = lua_pushthread(L);
+
+	/* Only the task's own coroutine escapes; a nested one is never pooled anyway. */
+	if (lp != NULL && lp->current >= 0 && lp->tasks[lp->current].co == L) {
+		lp->tasks[lp->current].escaped = 1U;
+	}
+	lua_pushboolean(L, ismain);
+
+	return 2;
 }
 
 void luaz_async_warn_blocking(lua_State *L, const char *fn)

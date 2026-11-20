@@ -31,6 +31,20 @@
 
 LOG_MODULE_REGISTER(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
 
+#ifdef CONFIG_LUA_LIB_COROUTINE
+/* The coroutine library, with coroutine.running() tracking escapes for the async pool. */
+static int open_coroutine(lua_State *L)
+{
+	(void)luaopen_coroutine(L);
+#if defined(CONFIG_LUA_ASYNC) && CONFIG_LUA_ASYNC_CORO_POOL > 0
+	lua_pushcfunction(L, luaz_async_coroutine_running);
+	lua_setfield(L, -2, "running");
+#endif
+
+	return 1;
+}
+#endif
+
 /**
  * @brief The custom allocator that Lua will use to dynamically allocate all
 relevant data in the context
@@ -404,7 +418,7 @@ void luaz_openlibs(lua_State *L)
 	lua_setfield(L, -2, "math");
 #endif
 #ifdef CONFIG_LUA_LIB_COROUTINE
-	lua_pushcfunction(L, luaopen_coroutine);
+	lua_pushcfunction(L, open_coroutine);
 	lua_setfield(L, -2, "coroutine");
 #endif
 #ifdef CONFIG_LUA_LIB_UTF8

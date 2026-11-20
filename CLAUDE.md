@@ -172,6 +172,7 @@ Deeper nesting (3+ levels) works the same way — always define leaf types first
 | `CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH` | `4`   | Default messages kept per awaited channel                          |
 | `CONFIG_LUA_ASYNC_MAX_DRAIN`     | `16`     | Messages taken from zbus per scheduler pass                        |
 | `CONFIG_LUA_ASYNC_THREAD_STACK_SIZE` | `4096` | Default stack size of async threads                            |
+| `CONFIG_LUA_ASYNC_CORO_POOL`     | `2`      | Finished task coroutines reused by `spawn`; never one that called `coroutine.running()` (0 disables) |
 | `CONFIG_LUA_ASYNC_STATS`         | `n`      | Scheduler counters + per-phase cycles (`async.stats()`)            |
 | `CONFIG_LUA_ALLOC_STATS`         | `n`      | Allocator counters (`luaz_alloc_stats_get()`)                      |
 | `CONFIG_LUA_FS`                  | `n`      | Enable filesystem support                                          |

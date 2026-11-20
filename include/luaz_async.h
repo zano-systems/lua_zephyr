@@ -36,6 +36,7 @@ struct luaz_async_stats {
 	uint32_t msgs;       /**< messages taken from the subscriber */
 	uint32_t decodes;    /**< messages converted to Lua tables */
 	uint32_t scans;      /**< task slots visited by linear searches */
+	uint32_t co_reuses;  /**< spawns that reused a pooled coroutine */
 	uint32_t cyc_hz;     /**< cycle counter frequency */
 	uint64_t cyc_total;  /**< whole run */
 	uint64_t cyc_resume; /**< inside lua_resume (task code + bindings) */
@@ -114,6 +115,17 @@ struct luaz_async_ctx {
  *         claimed; its registration is left disabled) or -EFAULT (scheduler fault).
  */
 int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n);
+
+/**
+ * @brief coroutine.running() for async threads.
+ *
+ * Same results as the standard one; it also marks the calling task as having
+ * exposed its coroutine, so the coroutine pool never reuses it.
+ *
+ * @param L  Calling Lua state.
+ * @return 2 (the running coroutine and whether it is the main one).
+ */
+int luaz_async_coroutine_running(lua_State *L);
 
 /**
  * @brief Expiry handler of the idle timer that LUAZ_ASYNC_DEFINE defines.

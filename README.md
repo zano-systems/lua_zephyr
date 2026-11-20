@@ -441,7 +441,15 @@ From the thread's Lua heap, on 32-bit targets:
   channels take 2208 B.
 - Each task: about 0.5 KB (548 B for one `spawn` on `native_sim`), almost all
   of it the Lua coroutine (its state and initial stack). A finished task's
-  coroutine is freed at the next garbage collection.
+  coroutine is reset and kept for the next `spawn`, up to
+  `CONFIG_LUA_ASYNC_CORO_POOL` (default 2, about 350 B each on 32-bit), until
+  the run ends; beyond that it is freed at the next garbage collection.
+  Reuse skips the allocation and the GC work: about 0.5 KB less per
+  spawn. Two kinds of task are never pooled: initial tasks, and tasks that
+  called `coroutine.running()`. So a coroutine a script stored stays that
+  task's coroutine ("dead" once the task ends) and never aliases a later
+  task. The debug library (`debug.getregistry()`) can still reach pooled
+  coroutines.
 - Each awaited channel: a ring of `queue_depth` message slots, reserved when
   the channel is first awaited or resized (each slot is the message size
   rounded up to `max_align_t`), plus one decoded table per reader. A depth
@@ -603,6 +611,7 @@ All options live under `Kconfig.luaz`.
 | `CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH` | `4`   | Default messages kept per awaited channel                            |
 | `CONFIG_LUA_ASYNC_MAX_DRAIN`     | `16`     | Messages taken from zbus per scheduler pass                          |
 | `CONFIG_LUA_ASYNC_THREAD_STACK_SIZE` | `4096` | Default stack size of async threads                                |
+| `CONFIG_LUA_ASYNC_CORO_POOL`     | `2`      | Finished task coroutines kept for reuse by `spawn` (0 disables)      |
 | `CONFIG_LUA_FS`                  | `n`      | Enable filesystem support for Lua scripts                            |
 | `CONFIG_LUA_FS_MOUNT_POINT`      | `"/lfs"` | Filesystem mount point prefix                                        |
 | `CONFIG_LUA_FS_MAX_FILE_SIZE`    | `4096`   | Maximum Lua script file size (bytes)                                 |

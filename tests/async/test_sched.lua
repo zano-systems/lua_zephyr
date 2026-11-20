@@ -199,4 +199,66 @@ return {
 		end)
 		T.same(log, { "a@10", "b@10", "c@10" })
 	end },
+
+	{ "a task that exposed its coroutine is never reused for another task", function(T)
+		local async = T.start()
+		local first, second
+		async._run(function()
+			async.spawn(function() first = coroutine.running() end):join()
+			async.spawn(function() second = coroutine.running() end):join()
+		end)
+		T.ok(first ~= nil and second ~= nil)
+		T.ok(first ~= second, "a stored coroutine.running() never aliases a later task")
+		T.eq(coroutine.status(first), "dead")
+	end },
+
+	{ "a reused coroutine starts clean after an error, a cancel and a <close>", function(T)
+		local async = T.start()
+		local closed = {}
+		local function closer(name)
+			return setmetatable({}, { __close = function() closed[name] = (closed[name] or 0) + 1 end })
+		end
+		local function fresh(...) -- checks it sees only its own arguments
+			local c <close> = closer("fresh")
+			return select("#", ...), ...
+		end
+		local results = {}
+		async._run(function()
+			-- an error, with a <close> pending
+			T.eq(async.spawn(function()
+				local c <close> = closer("err")
+				error("boom", 0)
+			end):join(), false)
+			results.after_error = table.pack(async.spawn(fresh, "a", nil):join())
+			-- a cancel while parked, with a <close> pending
+			local h = async.spawn(function()
+				local c <close> = closer("cancel")
+				async.sleep(100)
+			end)
+			async.yield()
+			T.eq(h:cancel(), true)
+			results.after_cancel = table.pack(async.spawn(fresh, 1, 2, 3):join())
+			-- a normal finish through a <close>, and a deep stack
+			local function deep(n) if n == 0 then return 0 end return 1 + deep(n - 1) end
+			T.eq(select(2, async.spawn(function()
+				local c <close> = closer("normal")
+				return deep(200)
+			end):join()), 200)
+			results.after_normal = table.pack(async.spawn(fresh):join())
+		end)
+		local function values(t)
+			local out = {}
+			for i = 1, t.n do
+				out[i] = tostring(t[i])
+			end
+			return out
+		end
+		T.same(values(results.after_error), { "true", "2", "a", "nil" }, "after an error")
+		T.same(values(results.after_cancel), { "true", "3", "1", "2", "3" }, "after a cancel")
+		T.same(values(results.after_normal), { "true", "0" }, "after a normal finish")
+		T.eq(closed.err, 1, "the failed task's <close> ran once")
+		T.eq(closed.cancel, 1, "the cancelled task's <close> ran once")
+		T.eq(closed.normal, 1, "the finished task's <close> ran once")
+		T.eq(closed.fresh, 3, "each new task ran only its own <close>")
+	end },
 }
