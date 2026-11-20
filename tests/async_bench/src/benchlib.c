@@ -295,6 +295,8 @@ static int luaopen_bench(lua_State *L)
 	luaL_newlib(L, funcs);
 	lua_pushstring(L, CONFIG_BENCH_PROFILE);
 	lua_setfield(L, -2, "profile");
+	lua_pushstring(L, CONFIG_BENCH_ONLY);
+	lua_setfield(L, -2, "only");
 #ifdef BENCH_BASELINE
 	lua_pushstring(L, BENCH_BASELINE);
 	lua_setfield(L, -2, "baseline");

@@ -5,6 +5,13 @@ config BENCH_PROFILE
 	  For PC sampling (scripts/pc_sample.py): the named case (e.g.
 	  "await_fanout/1") runs in a loop and nothing is printed.
 
+config BENCH_ONLY
+	string "Run only this bench case, once"
+	default ""
+	help
+	  Run the named case (e.g. "read_async") once in each GC mode, with
+	  the usual output and baseline checks. BENCH_PROFILE implies it.
+
 config BENCH_MARGIN_PCT
 	int "Allowed cycles/op regression against the board's baseline (%)"
 	range 1 100

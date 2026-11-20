@@ -19,12 +19,51 @@ local chans = {
 }
 local NAMES = { "b_c0", "b_c1", "b_c2", "b_c3" }
 
--- CONFIG_BENCH_PROFILE: run one case forever for PC sampling.
+-- Every task must finish its work. The scheduler reports a task's error and
+-- keeps running, so a workload that raises midway would end early and look
+-- fast; wrap each task to record that it got to the end.
+local function checked(measure)
+	return function(name, ops, ...)
+		local fns, done = { ... }, 0
+		for i, fn in ipairs({ ... }) do
+			fns[i] = function(...)
+				fn(...)
+				done = done + 1
+			end
+		end
+		local rc, cyc = measure(name, ops, table.unpack(fns))
+		return rc, cyc, done == #fns
+	end
+end
+
+local measure_checked = checked(bench.measure)
+bench.measure = function(name, ops, ...)
+	local rc, cyc, complete = measure_checked(name, ops, ...)
+	if not complete then
+		bench.fail(name .. ": a task raised before finishing its work")
+	end
+	return rc, cyc
+end
+
+-- Self-test: a task that raises midway must be caught by the check above.
+do
+	local _, _, complete = measure_checked("selftest/raise", 2, function()
+		async.yield()
+		error("selftest: raised on purpose")
+	end, function() end)
+	if complete then
+		bench.fail("selftest: a raising task was not detected")
+	end
+end
+
+-- CONFIG_BENCH_ONLY runs one case once; CONFIG_BENCH_PROFILE runs one case
+-- forever, without output, for PC sampling.
 local PROFILE = bench.profile
-if PROFILE ~= "" then
+local ONLY = PROFILE ~= "" and PROFILE or bench.only
+if ONLY ~= "" then
 	local measure = bench.measure
 	bench.measure = function(name, ...)
-		if name == PROFILE then
+		if name == ONLY then
 			return measure(name, ...)
 		end
 	end
@@ -151,11 +190,17 @@ local function lock_bench(n)
 	if bad > 0 then
 		bench.fail("pub_async: " .. bad .. " publishes failed")
 	end
+	-- Seeded outside the measured run, so the case does not depend on pub_async
+	-- (which CONFIG_BENCH_ONLY / CONFIG_BENCH_PROFILE may skip).
+	local SEED = 4242
+	if ch:pub({ seq = SEED, a = 1, b = 2, c = 3 }, 100) ~= 0 then
+		bench.fail("read_async: could not seed the channel")
+	end
 	bad = 0
 	bench.measure("read_async", n, function()
 		for _ = 1, n do
 			local m = ch:read_async()
-			if m == nil or m.seq ~= n then
+			if m == nil or m.seq ~= SEED then
 				bad = bad + 1
 			end
 		end

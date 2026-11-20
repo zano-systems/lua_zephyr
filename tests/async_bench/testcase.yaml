@@ -18,3 +18,6 @@ tests:
   lua_zephyr.async_bench.breakdown:
     extra_configs:
       - CONFIG_LUA_ASYNC_STATS=y
+  lua_zephyr.async_bench.only_read:
+    extra_configs:
+      - CONFIG_BENCH_ONLY="read_async"
