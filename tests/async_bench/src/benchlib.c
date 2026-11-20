@@ -160,9 +160,21 @@ static const char *gc_name = "inc";
 static int l_gc(lua_State *L)
 {
 	static const char *const modes[] = {"inc", "gen", NULL};
+	static int default_pause = -1;
 	int m = luaL_checkoption(L, 1, NULL, modes);
 
+	if (default_pause < 0) {
+		default_pause = lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE, -1);
+	}
+	/*
+	 * Incremental mode runs with CONFIG_BENCH_GC_INC_PAUSE: with Lua's default
+	 * pause the heap grows to 2.5x the live data between cycles, and the bench
+	 * heap fills up (emergency collections inside the measured window).
+	 * Generational mode keeps Lua's default.
+	 */
 	(void)lua_gc(L, m == 0 ? LUA_GCINC : LUA_GCGEN);
+	(void)lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE,
+		     m == 0 ? CONFIG_BENCH_GC_INC_PAUSE : default_pause);
 	gc_name = modes[m];
 
 	return 0;
@@ -232,6 +244,15 @@ static int l_measure(lua_State *L)
 	print_stats(name);
 #endif
 	if (rc != 0) {
+		failures++;
+	}
+	/*
+	 * A failed allocation means Lua ran an emergency full collection inside the
+	 * measured window: the numbers are not valid, and the heap is too small.
+	 */
+	if (a.fails != 0U) {
+		printk("BENCH FAIL %s: %u allocation failures (bench heap too small)\n", name,
+		       a.fails);
 		failures++;
 	}
 	lua_pushinteger(L, rc);
