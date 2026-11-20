@@ -24,7 +24,7 @@ def parse(path):
     with open(path, errors="replace") as f:
         for line in f:
             m = LINE.search(line)
-            if not m or m.group(2) == "FAIL":
+            if not m or m.group(2) in ("FAIL", "NOTE"):
                 continue
             kind, name, rest = m.groups()
             fields = dict(FIELD.findall(rest))
@@ -93,6 +93,8 @@ def emit_baseline(path):
                 break
     cases = {}
     for name, gc in order:
+        if name.startswith("selftest/"):
+            continue  # bench.lua's startup self-test, never checked against a baseline
         cases.setdefault(name, {})[gc] = int(bench[(name, gc)]["cyc/op"])
     print(f"-- cycles/op on {board}, from scripts/bench_table.py --emit-baseline.")
     print("-- tests/async_bench fails a case slower than this + CONFIG_BENCH_MARGIN_PCT.")
