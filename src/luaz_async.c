@@ -38,6 +38,11 @@ LOG_MODULE_DECLARE(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
 
 #define UNWATCH_BUDGET K_MSEC(100)
 
+/* Sequence number before a channel's first message; tests seed it near the 32-bit wrap. */
+#ifndef LUAZ_ASYNC_SEQ_START
+#define LUAZ_ASYNC_SEQ_START 0U
+#endif
+
 static const char loop_key;
 static const char anchor_key;
 static const char rx_key;
@@ -91,6 +96,7 @@ struct chan {
 	uint8_t *ring;                  /* depth slots of stride bytes; seq % depth */
 	size_t stride;                  /* message size rounded up for alignment */
 	uint32_t head;                  /* newest seq */
+	uint32_t head_slot;             /* ring slot of head */
 	uint32_t low;                   /* oldest seq held */
 	int depth;
 	bool watched;
@@ -761,9 +767,19 @@ static int chan_find(struct loop *lp, const struct zbus_channel *key)
 	return -1;
 }
 
+/*
+ * Slot of a held message (low <= seq <= head), counted back from the newest
+ * one. Not seq % depth: that aliases live slots when the 32-bit sequence wraps
+ * and depth is not a power of two.
+ */
 static uint8_t *ring_slot(const struct chan *ch, uint32_t seq)
 {
-	return ch->ring + (size_t)(seq % (uint32_t)ch->depth) * ch->stride;
+	uint32_t depth = (uint32_t)ch->depth;
+	uint32_t back = ch->head - seq;
+
+	__ASSERT_NO_MSG(back < depth);
+
+	return &ch->ring[(size_t)((ch->head_slot + depth - back) % depth) * ch->stride];
 }
 
 /* Pushes a ring userdata of depth slots; raises on overflow or no memory. */
@@ -806,8 +822,9 @@ static int chan_get(lua_State *L, struct loop *lp, const struct zbus_channel *ke
 		.ring_ref = ring_ref,
 		.ring = ring,
 		.stride = stride,
-		.head = 0,
-		.low = 1,
+		.head = LUAZ_ASYNC_SEQ_START,
+		.head_slot = 0,
+		.low = LUAZ_ASYNC_SEQ_START + 1U,
 		.depth = CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH,
 	};
 
@@ -833,14 +850,17 @@ static void ring_resize(lua_State *L, struct chan *ch, lua_Integer depth)
 	if ((int32_t)(from - ch->low) < 0) {
 		from = ch->low;
 	}
+	/* The newest message goes to the last slot of the new ring. */
 	for (uint32_t seq = from; (int32_t)(ch->head - seq) >= 0; seq++) {
-		memcpy(ring + (size_t)(seq % (uint32_t)depth) * ch->stride, ring_slot(ch, seq),
-		       ch->stride);
+		uint32_t slot = (uint32_t)depth - 1U - (ch->head - seq);
+
+		memcpy(&ring[(size_t)slot * ch->stride], ring_slot(ch, seq), ch->stride);
 	}
 	luaL_unref(L, LUA_REGISTRYINDEX, ch->ring_ref);
 	ch->ring_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	ch->ring = ring;
 	ch->depth = (int)depth;
+	ch->head_slot = (uint32_t)depth - 1U;
 	ch->low = from;
 }
 
@@ -873,6 +893,7 @@ static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *ke
 	}
 	ch = &lp->chans[c];
 	ch->head++;
+	ch->head_slot = (ch->head_slot + 1U) % (uint32_t)ch->depth;
 	memcpy(ring_slot(ch, ch->head), msg, zbus_chan_msg_size(key));
 	ring_trim(ch);
 

@@ -9,7 +9,7 @@ tests:
     harness_config:
       type: one_line
       regex:
-        - "async tests: 79 passed, 0 failed, 8 skipped"
+        - "async tests: 80 passed, 0 failed, 8 skipped"
   lua_zephyr.async.limits:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_CHANNELS=2
@@ -17,7 +17,7 @@ tests:
     harness_config:
       type: one_line
       regex:
-        - "async tests: 3 passed, 0 failed, 84 skipped"
+        - "async tests: 3 passed, 0 failed, 85 skipped"
   lua_zephyr.async.watch_fail:
     extra_configs:
       - CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_ALLOC_STATIC=y
@@ -26,28 +26,28 @@ tests:
     harness_config:
       type: one_line
       regex:
-        - "async tests: 3 passed, 0 failed, 84 skipped"
+        - "async tests: 3 passed, 0 failed, 85 skipped"
   lua_zephyr.async.readers:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_READERS=2
     harness_config:
       type: one_line
       regex:
-        - "async tests: 2 passed, 0 failed, 85 skipped"
+        - "async tests: 2 passed, 0 failed, 86 skipped"
   lua_zephyr.async.many:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_TASKS=64
     harness_config:
       type: one_line
       regex:
-        - "async tests: 2 passed, 0 failed, 85 skipped"
+        - "async tests: 2 passed, 0 failed, 86 skipped"
   lua_zephyr.async.lock_waits:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_LOCK_WAITS=1
     harness_config:
       type: one_line
       regex:
-        - "async tests: 2 passed, 0 failed, 85 skipped"
+        - "async tests: 2 passed, 0 failed, 86 skipped"
   lua_zephyr.async.obj_core:
     extra_configs:
       - CONFIG_OBJ_CORE=y
@@ -55,4 +55,11 @@ tests:
     harness_config:
       type: one_line
       regex:
-        - "async tests: 2 passed, 0 failed, 85 skipped"
+        - "async tests: 2 passed, 0 failed, 86 skipped"
+  lua_zephyr.async.seq_wrap:
+    extra_args:
+      - EXTRA_CFLAGS=-DLUAZ_ASYNC_SEQ_START=0xFFFFFFFAU
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 80 passed, 0 failed, 8 skipped"
