@@ -26,11 +26,10 @@
 /** @brief Form-feed (Ctrl+L) — clears the screen. */
 #define FF  0x0C
 
+/* A k_heap, so heap viewers such as zview find it; Lua allocates from its sys_heap. */
+K_HEAP_DEFINE(lua_repl_heap, CONFIG_LUA_THREAD_HEAP_SIZE);
+
 static struct {
-	struct {
-		char buffer[CONFIG_LUA_THREAD_HEAP_SIZE];
-		struct sys_heap heap;
-	} lua_heap;
 	char input_line[CONFIG_LUA_REPL_LINE_SIZE];
 } self = {};
 
@@ -125,9 +124,11 @@ static int lua_repl_cmd(const struct shell *sh, size_t argc, char **argv, void *
 
 	bool received_exit = false;
 
-	sys_heap_init(&self.lua_heap.heap, self.lua_heap.buffer, CONFIG_LUA_THREAD_HEAP_SIZE);
+	/* Start each session from an empty heap. */
+	sys_heap_init(&lua_repl_heap.heap, lua_repl_heap.heap.init_mem,
+		      lua_repl_heap.heap.init_bytes);
 
-	lua_State *L = lua_newstate(lua_zephyr_allocator, &self.lua_heap.heap, 0);
+	lua_State *L = lua_newstate(lua_zephyr_allocator, &lua_repl_heap.heap, 0);
 	if (L == NULL) {
 		shell_error(sh, "Failed to create Lua state");
 		return -ENOMEM;

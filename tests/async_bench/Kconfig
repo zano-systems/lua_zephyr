@@ -1,0 +1,40 @@
+config BENCH_PROFILE
+	string "Run only this bench case, forever, without output"
+	default ""
+	help
+	  For PC sampling (scripts/pc_sample.py): the named case (e.g.
+	  "await_fanout/1") runs in a loop and nothing is printed.
+
+config BENCH_ONLY
+	string "Run only this bench case, once"
+	default ""
+	help
+	  Run the named case (e.g. "read_async") once in each GC mode, with
+	  the usual output and baseline checks. BENCH_PROFILE implies it.
+
+config BENCH_GC_INC_PAUSE
+	int "Collector pause (%) for the incremental-GC runs"
+	range 100 1000
+	default 150
+	help
+	  Lua 5.5 defaults to 250: the heap grows to 2.5x the live data before
+	  a cycle starts, which overflows the bench heap and adds emergency
+	  collections to the measurements. 150 is a usual setting for small
+	  embedded heaps. Generational runs keep Lua's default.
+
+config BENCH_MARGIN_PCT
+	int "Allowed cycles/op regression against the board's baseline (%)"
+	range 1 100
+	default 10
+	help
+	  With a baseline file for the board (baselines/<board>.lua), a case
+	  slower than baseline + margin fails the run; one faster than
+	  baseline - margin prints a note to refresh the baseline. Not applied
+	  with LUA_ASYNC_STATS, whose instrumentation changes the numbers.
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP
+module-str = APP

@@ -2,8 +2,9 @@
  * @file luaz_async.c
  * @brief zephyr.async: cooperative scheduler on zbus, and its thread entry.
  *
- * Parking calls yield `REQ, kind, args...`. On wake, the reply is pushed onto
- * the task's stack, so it becomes the parking call's return values.
+ * A parking call stores its request in the task record and yields no values,
+ * so a yield without a request is a stray coroutine.yield. On wake, the reply
+ * is pushed onto the task's stack and becomes the parking call's results.
  */
 
 #include <errno.h>
@@ -23,6 +24,10 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/zbus/zbus.h>
 
+#if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
+#include <zephyr/timing/timing.h>
+#endif
+
 LOG_MODULE_DECLARE(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
 
 #define HANDLE_MT "zephyr.async.handle"
@@ -33,11 +38,15 @@ LOG_MODULE_DECLARE(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
 
 #define UNWATCH_BUDGET K_MSEC(100)
 
+/* Sequence number before a channel's first message; tests seed it near the 32-bit wrap. */
+#ifndef LUAZ_ASYNC_SEQ_START
+#define LUAZ_ASYNC_SEQ_START 0U
+#endif
+
 static const char loop_key;
+static const char anchor_key;
 static const char rx_key;
 static const char warned_key;
-static const char req_tag;
-#define REQ ((void *)&req_tag)
 
 enum {
 	KIND_YIELD = 1,
@@ -73,19 +82,75 @@ struct task {
 	int nreply;          /* values on co's stack for the next resume */
 	sys_slist_t readers; /* struct luaz_async_reader, one per awaited channel */
 	const struct zbus_channel *lock_chan; /* T_LOCKING: the lock it waits for */
+	int32_t req_ms;                       /* request: timeout, -1 for forever */
 	int16_t target;                       /* T_WAITING: channel; T_JOINING: task; else -1 */
+	int16_t req_target;                   /* request: channel or task */
 	uint8_t state;
 	uint8_t has_deadline;
+	uint8_t req;     /* KIND_* set by the parking call, 0 for none */
+	uint8_t escaped; /* called coroutine.running(): never pooled */
 };
 
 struct chan {
 	const struct zbus_channel *key; /* NULL: free */
-	int ring_ref;                   /* seq -> raw message */
+	int ring_ref;                   /* registry ref anchoring ring */
+	uint8_t *ring;                  /* depth slots of stride bytes; seq % depth */
+	size_t stride;                  /* message size rounded up for alignment */
 	uint32_t head;                  /* newest seq */
+	uint32_t head_slot;             /* ring slot of head */
 	uint32_t low;                   /* oldest seq held */
 	int depth;
 	bool watched;
 };
+
+/* Profiling counters (CONFIG_LUA_ASYNC_STATS); no code when disabled. */
+#ifdef CONFIG_LUA_ASYNC_STATS
+#ifdef CONFIG_TIMING_FUNCTIONS
+#define STAT_CLOCK timing_t
+
+static inline timing_t stat_now(void)
+{
+	return timing_counter_get();
+}
+
+static inline uint64_t stat_since(timing_t t0)
+{
+	timing_t t1 = timing_counter_get();
+
+	return timing_cycles_get(&t0, &t1);
+}
+
+static uint32_t stat_hz(void)
+{
+	return (uint32_t)timing_freq_get();
+}
+#else
+#define STAT_CLOCK uint32_t
+
+static inline uint32_t stat_now(void)
+{
+	return k_cycle_get_32();
+}
+
+static inline uint64_t stat_since(uint32_t t0)
+{
+	return (uint32_t)(k_cycle_get_32() - t0);
+}
+
+static uint32_t stat_hz(void)
+{
+	return (uint32_t)sys_clock_hw_cycles_per_sec();
+}
+#endif
+#define STAT_ADD(_lp, _f, _n) ((_lp)->stats->_f += (_n))
+#define STAT_T0(_v)           STAT_CLOCK _v = stat_now()
+#define STAT_CYC(_lp, _f, _v) ((_lp)->stats->_f += stat_since(_v))
+#else
+#define STAT_ADD(_lp, _f, _n) ((void)(_lp))
+#define STAT_T0(_v)           (void)0
+#define STAT_CYC(_lp, _f, _v) ((void)(_lp))
+#endif
+#define STAT_INC(_lp, _f) STAT_ADD(_lp, _f, 1)
 
 struct loop {
 	int current; /* -1 when no task runs */
@@ -95,18 +160,92 @@ struct loop {
 	int rq_len;
 	int pass_left; /* tasks of the current pass still queued, at the front */
 	int ntimed;
+	int nlocking;           /* tasks in T_LOCKING */
+	int32_t timer_deadline; /* when timer_armed: the deadline the idle timer fires at */
+	bool timer_armed;
 	bool draining;
 	struct k_mem_slab *readers;
+	struct rx *rx;
+#ifdef CONFIG_LUA_ASYNC_STATS
+	struct luaz_async_stats *stats;
+	STAT_CLOCK run_t0; /* start of the run, for a live cyc_total */
+#endif
 	struct task tasks[MAX_TASKS];
 	struct chan chans[MAX_CHANS];
 	int16_t runq[MAX_TASKS];
 	int16_t timed[MAX_TASKS];
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	int npool;
+	struct {
+		lua_State *co; /* reset with lua_closethread() */
+		int ref;       /* registry ref keeping it alive */
+	} pool[CONFIG_LUA_ASYNC_CORO_POOL];
+#endif
 };
 
 struct handle {
 	int slot;
 	uint8_t final;
 };
+
+/*
+ * Per-state record the bindings carry as upvalue 1, so they reach the running
+ * scheduler without a registry lookup. lp is NULL between runs, so a task
+ * coroutine resumed after its run sees "not running" rather than a stale loop.
+ */
+struct anchor {
+	struct loop *lp;
+	const struct anchor *self; /* checked before use: see up_loop() */
+};
+
+/* Returns the state's anchor, creating it on first use (may raise). */
+static struct anchor *anchor_get(lua_State *L)
+{
+	struct anchor *a;
+
+	if (lua_rawgetp(L, LUA_REGISTRYINDEX, &anchor_key) == LUA_TUSERDATA) {
+		a = lua_touserdata(L, -1);
+		lua_pop(L, 1);
+		return a;
+	}
+	lua_pop(L, 1);
+	a = lua_newuserdatauv(L, sizeof(*a), 0);
+	a->lp = NULL;
+	a->self = a;
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &anchor_key);
+
+	return a;
+}
+
+/* Never raises; NULL when no anchor was created yet. */
+static struct anchor *anchor_find(lua_State *L)
+{
+	struct anchor *a;
+
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &anchor_key);
+	a = lua_touserdata(L, -1);
+	lua_pop(L, 1);
+
+	return a;
+}
+
+/* The running loop as seen from a binding (a C closure with the anchor upvalue). */
+static struct loop *up_loop(lua_State *L)
+{
+	const int up = lua_upvalueindex(1);
+	const struct anchor *a = lua_touserdata(L, up);
+
+	/*
+	 * Only the debug library can replace a C closure's upvalue; fail instead
+	 * of reading another object as the anchor. (A script with the debug
+	 * library can break memory safety in other ways: see LUA_LIB_DEBUG.)
+	 */
+	if (a == NULL || lua_rawlen(L, up) != sizeof(*a) || a->self != a) {
+		luaL_error(L, "async: binding upvalue was replaced");
+	}
+
+	return a->lp;
+}
 
 static struct loop *get_loop(lua_State *L)
 {
@@ -148,11 +287,44 @@ static struct rx *check_rx(lua_State *L)
 	return c;
 }
 
+/*
+ * Channel methods carry the channel metatable as upvalue 2: comparing against
+ * it avoids luaL_testudata()'s registry lookup by name.
+ */
 static const struct zbus_channel *to_chan(lua_State *L, int idx)
 {
-	const struct zbus_channel **ud = luaL_testudata(L, idx, ZBUS_CHAN_METATABLE);
+	const struct zbus_channel **ud = lua_touserdata(L, idx);
+	bool ok;
 
-	return ud != NULL ? *ud : NULL;
+	if (ud == NULL || lua_rawlen(L, idx) != sizeof(*ud) || lua_getmetatable(L, idx) == 0) {
+		return NULL;
+	}
+	ok = lua_rawequal(L, -1, lua_upvalueindex(2));
+	lua_pop(L, 1);
+
+	return ok ? *ud : NULL;
+}
+
+/*
+ * Wrap-safe 32-bit arithmetic on sequence numbers and millisecond deadlines.
+ * The unsigned result is held in a temporary before the signed conversion, so
+ * no composite unsigned expression is converted to a signed type (MISRA C:2025
+ * Rule 10.8). Values above INT32_MAX convert modulo 2^32: implementation-defined
+ * in C11 6.3.1.3, and what GCC and Clang do. Comparisons through wrap_diff()
+ * hold while the two values are less than 2^31 apart.
+ */
+static inline int32_t wrap_diff(uint32_t a, uint32_t b)
+{
+	uint32_t d = a - b;
+
+	return (int32_t)d;
+}
+
+static inline int32_t wrap_add(int32_t a, uint32_t b)
+{
+	uint32_t sum = (uint32_t)a + b;
+
+	return (int32_t)sum;
 }
 
 static int32_t uptime(void)
@@ -255,13 +427,13 @@ static void runq_remove(struct loop *lp, int slot)
 /* Deadlines wrap at 32 bits: compare differences. */
 static bool before(const struct task *a, const struct task *b)
 {
-	int32_t d = (int32_t)((uint32_t)a->deadline - (uint32_t)b->deadline);
+	int32_t d = wrap_diff((uint32_t)a->deadline, (uint32_t)b->deadline);
 
 	if (d != 0) {
 		return d < 0;
 	}
 
-	return (int32_t)(a->park_seq - b->park_seq) < 0;
+	return wrap_diff(a->park_seq, b->park_seq) < 0;
 }
 
 static void timed_remove(struct loop *lp, int slot)
@@ -285,7 +457,7 @@ static void park(lua_State *L, struct loop *lp, int slot, int32_t ms)
 	if (ms >= 0) {
 		int i = lp->ntimed;
 
-		t->deadline = (int32_t)((uint32_t)uptime() + (uint32_t)ms);
+		t->deadline = wrap_add(uptime(), (uint32_t)ms);
 		while (i > 0 && before(t, &lp->tasks[lp->timed[i - 1]])) {
 			lp->timed[i] = lp->timed[i - 1];
 			i--;
@@ -308,7 +480,11 @@ static void wake(lua_State *L, struct loop *lp, int slot, int nvals)
 {
 	struct task *t = &lp->tasks[slot];
 
+	STAT_INC(lp, wakes);
 	clear_deadline(lp, slot);
+	if (t->state == T_LOCKING) {
+		lp->nlocking--;
+	}
 	t->state = T_READY;
 	t->target = -1;
 	t->lock_chan = NULL;
@@ -325,6 +501,7 @@ static int parked_on(struct loop *lp, uint8_t st, int target, int16_t out[MAX_TA
 {
 	int n = 0;
 
+	STAT_ADD(lp, scans, MAX_TASKS);
 	for (int s = 0; s < MAX_TASKS; s++) {
 		const struct task *t = &lp->tasks[s];
 		int i;
@@ -333,7 +510,7 @@ static int parked_on(struct loop *lp, uint8_t st, int target, int16_t out[MAX_TA
 			continue;
 		}
 		i = n++;
-		while (i > 0 && (int32_t)(lp->tasks[out[i - 1]].park_seq - t->park_seq) > 0) {
+		while (i > 0 && wrap_diff(lp->tasks[out[i - 1]].park_seq, t->park_seq) > 0) {
 			out[i] = out[i - 1];
 			i--;
 		}
@@ -406,12 +583,32 @@ static int new_task(lua_State *L, struct loop *lp, int nargs)
 	lua_State *co;
 
 	memset(t, 0, sizeof(*t));
-	co = lua_newthread(L);
-	/* Raise before the slot is taken: a new coroutine only guarantees LUA_MINSTACK slots. */
-	if (lua_checkstack(co, nargs + 1) == 0) {
-		return luaL_error(L, "async.spawn: too many arguments (%d)", nargs);
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	/*
+	 * lua_newthread() copies the spawner's hook (the C hook and its mask), which a
+	 * pooled coroutine would not have: with a hook set, create the coroutine fresh.
+	 */
+	if (lp->npool > 0 && lua_gethook(L) == NULL) {
+		co = lp->pool[lp->npool - 1].co;
+		/* Raise before the slot or the pooled coroutine is taken. */
+		if (lua_checkstack(co, nargs + 1) == 0) {
+			return luaL_error(L, "async.spawn: too many arguments (%d)", nargs);
+		}
+		lp->npool--;
+		STAT_INC(lp, co_reuses);
+		t->co_ref = lp->pool[lp->npool].ref;
+	} else
+#endif
+	{
+		co = lua_newthread(L);
+		/* Raise before the slot is taken: a new coroutine only guarantees LUA_MINSTACK
+		 * slots.
+		 */
+		if (lua_checkstack(co, nargs + 1) == 0) {
+			return luaL_error(L, "async.spawn: too many arguments (%d)", nargs);
+		}
+		t->co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	}
-	t->co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	t->co = co;
 	lua_xmove(L, co, nargs + 1);
 	t->nreply = nargs;
@@ -434,10 +631,34 @@ static void detach(struct loop *lp, int slot)
 	clear_deadline(lp, slot);
 }
 
+/*
+ * Keeps a finished task's coroutine for the next spawn when it is safe to:
+ * not an initial task, never exposed through coroutine.running(), room in the
+ * pool, and a clean reset. Otherwise it is dropped for the GC.
+ */
+static void release_co(lua_State *L, struct loop *lp, struct task *t, bool initial)
+{
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	/* A hook set on the coroutine survives lua_closethread(): never pool one. */
+	if (!initial && t->escaped == 0U && lua_gethook(t->co) == NULL &&
+	    lp->npool < CONFIG_LUA_ASYNC_CORO_POOL && lua_closethread(t->co, L) == LUA_OK) {
+		lp->pool[lp->npool].co = t->co;
+		lp->pool[lp->npool].ref = t->co_ref;
+		lp->npool++;
+		return;
+	}
+#else
+	ARG_UNUSED(lp);
+	ARG_UNUSED(initial);
+#endif
+	luaL_unref(L, LUA_REGISTRYINDEX, t->co_ref);
+}
+
 /* The handle keeps the outcome, so it stays valid after the slot is reused. */
 static void retire(lua_State *L, struct loop *lp, int slot, uint8_t final, int ridx)
 {
 	struct task *t = &lp->tasks[slot];
+	bool initial = (t->handle_ref == LUA_NOREF);
 
 	ridx = lua_absindex(L, ridx);
 	if (t->handle_ref != LUA_NOREF) {
@@ -452,8 +673,11 @@ static void retire(lua_State *L, struct loop *lp, int slot, uint8_t final, int r
 		luaL_unref(L, LUA_REGISTRYINDEX, t->handle_ref);
 	}
 
-	luaL_unref(L, LUA_REGISTRYINDEX, t->co_ref);
+	release_co(L, lp, t, initial);
 	free_readers(lp, t);
+	if (t->state == T_LOCKING) {
+		lp->nlocking--;
+	}
 	memset(t, 0, sizeof(*t));
 	t->state = T_FREE;
 	lp->live--;
@@ -517,18 +741,26 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 	struct task *t = &lp->tasks[slot];
 	lua_State *co = t->co;
 	int nres = 0;
+	int kind;
 	int st;
-	int base;
 
 	t->state = T_RUNNING;
 	lp->current = slot;
+	STAT_INC(lp, resumes);
+	STAT_T0(t0);
 	st = lua_resume(co, L, t->nreply, &nres);
+	STAT_CYC(lp, cyc_resume, t0);
 	lp->current = -1;
 	t->nreply = 0;
 
 	if (st == LUA_OK) {
 		int top = lua_gettop(L);
 
+		if (t->handle_ref == LUA_NOREF) {
+			/* An initial task: no handle keeps the results, so no one can join. */
+			retire(L, lp, slot, H_DONE, 0);
+			return;
+		}
 		luaL_checkstack(L, nres + 4, "async: results");
 		lua_pushboolean(L, 1);
 		lua_xmove(co, L, nres);
@@ -571,10 +803,10 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 		return;
 	}
 
-	/* Untagged yields come from coroutine.yield in a task body. */
-	base = lua_gettop(co) - nres + 1;
-	if (nres < 2 || lua_touserdata(co, base) != REQ ||
-	    lua_type(co, base) != LUA_TLIGHTUSERDATA) {
+	/* Yields without a request come from coroutine.yield in a task body. */
+	kind = t->req;
+	t->req = 0;
+	if (kind == 0 || nres != 0) {
 		lua_pop(co, nres);
 		(void)close_task(L, lp, slot);
 		lua_pop(L, 1);
@@ -584,35 +816,33 @@ static void run_task(lua_State *L, struct loop *lp, int slot)
 		return;
 	}
 
-	switch (lua_tointeger(co, base + 1)) {
+	switch (kind) {
 	case KIND_YIELD:
 		t->state = T_READY;
 		enqueue(lp, slot);
 		break;
 	case KIND_SLEEP:
 		t->state = T_SLEEPING;
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 2));
+		park(L, lp, slot, t->req_ms);
 		break;
 	case KIND_AWAIT:
 		t->state = T_WAITING;
-		t->target = (int16_t)lua_tointeger(co, base + 2);
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 3));
+		t->target = t->req_target;
+		park(L, lp, slot, t->req_ms);
 		break;
 	case KIND_JOIN:
 		t->state = T_JOINING;
-		t->target = (int16_t)lua_tointeger(co, base + 2);
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 3));
+		t->target = t->req_target;
+		park(L, lp, slot, t->req_ms);
 		break;
 	case KIND_LOCK:
 		t->state = T_LOCKING;
-		t->lock_chan = lua_touserdata(co, base + 2);
-		park(L, lp, slot, (int32_t)lua_tointeger(co, base + 3));
+		lp->nlocking++;
+		park(L, lp, slot, t->req_ms);
 		break;
 	default:
-		lua_pop(co, nres);
 		luaL_error(L, "async: unknown request");
 	}
-	lua_pop(co, nres);
 }
 
 static int chan_find(struct loop *lp, const struct zbus_channel *key)
@@ -626,10 +856,36 @@ static int chan_find(struct loop *lp, const struct zbus_channel *key)
 	return -1;
 }
 
-/* -1 when every channel record is taken. */
-static int chan_get(lua_State *L, struct loop *lp, int idx)
+/*
+ * Slot of a held message (low <= seq <= head), counted back from the newest
+ * one. Not seq % depth: that aliases live slots when the 32-bit sequence wraps
+ * and depth is not a power of two.
+ */
+static uint8_t *ring_slot(const struct chan *ch, uint32_t seq)
 {
-	const struct zbus_channel *key = to_chan(L, idx);
+	uint32_t depth = (uint32_t)ch->depth;
+	uint32_t back = ch->head - seq;
+
+	__ASSERT_NO_MSG(back < depth);
+
+	return &ch->ring[(size_t)((ch->head_slot + depth - back) % depth) * ch->stride];
+}
+
+/* Pushes a ring userdata of depth slots; raises on overflow or no memory. */
+static uint8_t *ring_new(lua_State *L, size_t stride, lua_Integer depth)
+{
+	if ((uint64_t)depth > (uint64_t)(SIZE_MAX / stride) || depth > INT32_MAX) {
+		luaL_error(L, "queue_depth: depth %d is too large", (int)depth);
+	}
+
+	return lua_newuserdatauv(L, stride * (size_t)depth, 0);
+}
+
+/* -1 when every channel record is taken. */
+static int chan_get(lua_State *L, struct loop *lp, const struct zbus_channel *key, int idx)
+{
+	size_t stride;
+	uint8_t *ring;
 	int ring_ref;
 	int c;
 
@@ -646,58 +902,75 @@ static int chan_get(lua_State *L, struct loop *lp, int idx)
 	}
 
 	/* Allocate before taking the record: if this raises, the record stays free. */
-	lua_newtable(L);
+	stride = ROUND_UP(MAX(zbus_chan_msg_size(key), 1U), sizeof(max_align_t));
+	ring = ring_new(L, stride, CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH);
 	ring_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
 	lp->chans[c] = (struct chan){
 		.key = key,
 		.ring_ref = ring_ref,
-		.head = 0,
-		.low = 1,
+		.ring = ring,
+		.stride = stride,
+		.head = LUAZ_ASYNC_SEQ_START,
+		.head_slot = 0,
+		.low = LUAZ_ASYNC_SEQ_START + 1U,
 		.depth = CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH,
 	};
 
 	return c;
 }
 
-static void ring_trim(lua_State *L, struct chan *ch)
+/* Forgets the messages that no longer fit in depth slots. */
+static void ring_trim(struct chan *ch)
 {
 	uint32_t min = ch->head - (uint32_t)ch->depth + 1;
 
-	if ((int32_t)(min - ch->low) <= 0) {
-		return;
+	if (wrap_diff(min, ch->low) > 0) {
+		ch->low = min;
 	}
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ch->ring_ref);
-	while ((int32_t)(min - ch->low) > 0) {
-		lua_pushnil(L);
-		lua_rawseti(L, -2, (lua_Integer)ch->low);
-		ch->low++;
+}
+
+/* Moves the newest messages that fit into a ring of depth slots. */
+static void ring_resize(lua_State *L, struct chan *ch, lua_Integer depth)
+{
+	uint8_t *ring = ring_new(L, ch->stride, depth);
+	uint32_t from = ch->head - (uint32_t)depth + 1;
+
+	if (wrap_diff(from, ch->low) < 0) {
+		from = ch->low;
 	}
-	lua_pop(L, 1);
+	/* The newest message goes to the last slot of the new ring. */
+	for (uint32_t seq = from; wrap_diff(ch->head, seq) >= 0; seq++) {
+		uint32_t slot = (uint32_t)depth - 1U - (ch->head - seq);
+
+		memcpy(&ring[(size_t)slot * ch->stride], ring_slot(ch, seq), ch->stride);
+	}
+	luaL_unref(L, LUA_REGISTRYINDEX, ch->ring_ref);
+	ch->ring_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	ch->ring = ring;
+	ch->depth = (int)depth;
+	ch->head_slot = (uint32_t)depth - 1U;
+	ch->low = from;
 }
 
 static void push_decoded(lua_State *L, struct loop *lp, int c, uint32_t seq)
 {
 	const struct zbus_channel *chan = lp->chans[c].key;
 	const struct lua_msg_descr *descr = zbus_chan_user_data(chan);
-	struct rx *cl = check_rx(L);
-	size_t len;
-	const char *raw;
+	struct rx *cl = lp->rx;
+	size_t len = zbus_chan_msg_size(chan);
 
-	lua_rawgeti(L, LUA_REGISTRYINDEX, lp->chans[c].ring_ref);
-	lua_rawgeti(L, -1, (lua_Integer)seq);
-	raw = lua_tolstring(L, -1, &len);
-	if (raw == NULL || len != zbus_chan_msg_size(chan) || len > cl->buf_size) {
+	if (len > cl->buf_size) {
 		luaL_error(L, "async: cannot decode message on '%s'", zbus_chan_name(chan));
 	}
-	/* Lua string data may be misaligned for the struct. */
-	memcpy(cl->buf, raw, len);
-	lua_pop(L, 2);
+	/* Decode a copy: a __gc run by the decoder's allocations may resize the ring. */
+	memcpy(cl->buf, ring_slot(&lp->chans[c], seq), len);
+	STAT_INC(lp, decodes);
 	lua_msg_descr_to_table(L, descr->fields, descr->field_count, cl->buf);
 }
 
-/* The raw message is on top of L and stays there. */
-static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *key)
+/* Stores msg as the channel's newest message and wakes its waiters. */
+static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *key, const void *msg)
 {
 	int c = chan_find(lp, key);
 	struct chan *ch;
@@ -709,11 +982,9 @@ static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *ke
 	}
 	ch = &lp->chans[c];
 	ch->head++;
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ch->ring_ref);
-	lua_pushvalue(L, -2);
-	lua_rawseti(L, -2, (lua_Integer)ch->head);
-	lua_pop(L, 1);
-	ring_trim(L, ch);
+	ch->head_slot = (ch->head_slot + 1U) % (uint32_t)ch->depth;
+	memcpy(ring_slot(ch, ch->head), msg, zbus_chan_msg_size(key));
+	ring_trim(ch);
 
 	/* A waiter got its reader before parking. */
 	n = parked_on(lp, T_WAITING, c, order);
@@ -726,13 +997,18 @@ static void deliver(lua_State *L, struct loop *lp, const struct zbus_channel *ke
 
 static void expire(lua_State *L, struct loop *lp)
 {
-	int32_t now = uptime();
+	int32_t now;
+
+	if (lp->ntimed == 0) {
+		return;
+	}
+	now = uptime();
 
 	while (lp->ntimed > 0) {
 		int slot = lp->timed[0];
 		struct task *t = &lp->tasks[slot];
 
-		if ((int32_t)((uint32_t)t->deadline - (uint32_t)now) > 0) {
+		if (wrap_diff((uint32_t)t->deadline, (uint32_t)now) > 0) {
 			break;
 		}
 		timed_remove(lp, slot);
@@ -747,23 +1023,20 @@ static void expire(lua_State *L, struct loop *lp)
 	}
 }
 
-/* Pushes the next raw message and sets *chan; 0 when none is queued. */
-static int poll(lua_State *L, const struct zbus_channel **chan)
+/* Takes the next message into the rx buffer and sets *chan; 0 when none is queued. */
+static int poll(struct rx *c, const struct zbus_channel **chan)
 {
-	struct rx *c = check_rx(L);
-
 	*chan = NULL;
-	if (zbus_sub_wait_msg(c->ctx->sub, chan, c->buf, K_NO_WAIT) != 0 || *chan == NULL) {
-		return 0;
-	}
 
-	lua_pushlstring(L, (const char *)c->buf, zbus_chan_msg_size(*chan));
-
-	return 1;
+	return zbus_sub_wait_msg(c->ctx->sub, chan, c->buf, K_NO_WAIT) == 0 && *chan != NULL;
 }
 
 static void check_locks(lua_State *L, struct loop *lp)
 {
+	if (lp->nlocking == 0) {
+		return;
+	}
+	STAT_ADD(lp, scans, MAX_TASKS);
 	for (int s = 0; s < MAX_TASKS; s++) {
 		struct task *t = &lp->tasks[s];
 
@@ -773,23 +1046,67 @@ static void check_locks(lua_State *L, struct loop *lp)
 	}
 }
 
-/*
- * Sleeps until a message is queued, a lock a task waits for is free, or the
- * timeout. One event per distinct lock, up to MAX_LOCKS: beyond that the wait
- * is cut to one tick, so check_locks() sees the other locks within a tick.
- */
-static void idle_wait(lua_State *L, struct loop *lp, int32_t timeout_ms)
+void luaz_async_timer_expired(struct k_timer *timer)
 {
-	struct k_poll_event ev[1 + MAX_LOCKS];
-	k_timeout_t timeout = timeout_ms < 0 ? K_FOREVER : K_MSEC(timeout_ms);
+	k_poll_signal_raise(k_timer_user_data_get(timer), 0);
+}
+
+/*
+ * Keeps the idle timer at or before the earliest deadline. It is re-armed
+ * only when that deadline moves earlier: when it moves later (a task re-parks
+ * with a new timeout), the timer fires early once and is re-armed then, so
+ * timed awaits do not arm and cancel a kernel timeout on every message.
+ * Returns true when the earliest deadline has already passed.
+ */
+static bool timer_due(struct loop *lp)
+{
+	int32_t deadline;
+	int32_t left;
+
+	if (lp->ntimed == 0) {
+		return false; /* an armed timer just causes one spurious pass */
+	}
+	deadline = lp->tasks[lp->timed[0]].deadline;
+	if (lp->timer_armed && wrap_diff((uint32_t)deadline, (uint32_t)lp->timer_deadline) >= 0) {
+		return false;
+	}
+	left = wrap_diff((uint32_t)deadline, (uint32_t)uptime());
+	if (left <= 0) {
+		return true;
+	}
+	k_timer_start(lp->rx->ctx->timer, K_MSEC(left), K_NO_WAIT);
+	lp->timer_armed = true;
+	lp->timer_deadline = deadline;
+
+	return false;
+}
+
+/*
+ * Sleeps until a message is queued, the idle timer fires, or a lock a task
+ * waits for is free. One event per distinct lock, up to MAX_LOCKS: beyond
+ * that the wait is cut to one tick, so check_locks() sees the other locks
+ * within a tick.
+ */
+static void idle_wait(lua_State *L, struct loop *lp)
+{
+	struct k_poll_event ev[2 + MAX_LOCKS];
+	struct k_poll_signal *tick = lp->rx->ctx->tick;
+	k_timeout_t timeout = K_FOREVER;
+	unsigned int signaled;
 	bool overflow = false;
+	int result;
 	int n = 0;
 
+	ARG_UNUSED(L);
 	k_poll_event_init(&ev[n++], K_POLL_TYPE_FIFO_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY,
-			  check_rx(L)->ctx->sub->message_fifo);
-	for (int s = 0; s < MAX_TASKS && !overflow; s++) {
+			  lp->rx->ctx->sub->message_fifo);
+	k_poll_event_init(&ev[n++], K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, tick);
+	if (lp->nlocking > 0) {
+		STAT_ADD(lp, scans, MAX_TASKS);
+	}
+	for (int s = 0; s < MAX_TASKS && !overflow && lp->nlocking > 0; s++) {
 		struct k_sem *sem;
-		int i = 1;
+		int i = 2;
 
 		if (lp->tasks[s].state != T_LOCKING) {
 			continue;
@@ -808,16 +1125,23 @@ static void idle_wait(lua_State *L, struct loop *lp, int32_t timeout_ms)
 					  K_POLL_MODE_NOTIFY_ONLY, sem);
 		}
 	}
-	if (overflow && (timeout_ms < 0 || k_ms_to_ticks_ceil32((uint32_t)timeout_ms) > 1)) {
+	if (overflow) {
 		timeout = K_TICKS(1);
 	}
 	(void)k_poll(ev, n, timeout);
+
+	k_poll_signal_check(tick, &signaled, &result);
+	if (signaled != 0U) {
+		k_poll_signal_reset(tick);
+		lp->timer_armed = false;
+	}
 }
 
 /* True when more messages may be queued. Not reentered from a __gc that awaits. */
 static bool drain(lua_State *L, struct loop *lp)
 {
 	const struct zbus_channel *key;
+	struct rx *c = lp->rx;
 	bool hit_limit = true;
 
 	if (lp->draining) {
@@ -825,12 +1149,17 @@ static bool drain(lua_State *L, struct loop *lp)
 	}
 	lp->draining = true;
 	for (int i = 0; i < CONFIG_LUA_ASYNC_MAX_DRAIN; i++) {
-		if (poll(L, &key) == 0) {
+		/* Lock-free peek: skips the locked get when nothing is queued. */
+		if (k_fifo_is_empty(c->ctx->sub->message_fifo)) {
 			hit_limit = false;
 			break;
 		}
-		deliver(L, lp, key);
-		lua_pop(L, 1);
+		if (poll(c, &key) == 0) {
+			hit_limit = false;
+			break;
+		}
+		STAT_INC(lp, msgs);
+		deliver(L, lp, key, c->buf);
 	}
 	lp->draining = false;
 
@@ -842,10 +1171,20 @@ static int loop_body(lua_State *L)
 	struct loop *lp = get_loop(L);
 
 	while (lp->live > 0) {
-		bool hit_limit = drain(L, lp);
+		bool hit_limit;
 
+		STAT_INC(lp, passes);
+		STAT_T0(t_drain);
+		hit_limit = drain(L, lp);
+		STAT_CYC(lp, cyc_drain, t_drain);
+
+		STAT_T0(t_expire);
 		expire(L, lp);
+		STAT_CYC(lp, cyc_expire, t_expire);
+
+		STAT_T0(t_locks);
 		check_locks(L, lp);
+		STAT_CYC(lp, cyc_locks, t_locks);
 
 		/* Tasks made ready while running wait for the next pass. */
 		lp->pass_left = lp->rq_len;
@@ -854,17 +1193,11 @@ static int loop_body(lua_State *L)
 			run_task(L, lp, dequeue(lp));
 		}
 
-		if (lp->live > 0 && lp->rq_len == 0 && !hit_limit) {
-			int32_t timeout = -1;
-
-			if (lp->ntimed > 0) {
-				timeout = (int32_t)((uint32_t)lp->tasks[lp->timed[0]].deadline -
-						    (uint32_t)uptime());
-				if (timeout < 0) {
-					timeout = 0;
-				}
-			}
-			idle_wait(L, lp, timeout);
+		if (lp->live > 0 && lp->rq_len == 0 && !hit_limit && !timer_due(lp)) {
+			STAT_INC(lp, idle_waits);
+			STAT_T0(t_idle);
+			idle_wait(L, lp);
+			STAT_CYC(lp, cyc_idle, t_idle);
 		}
 	}
 
@@ -883,6 +1216,7 @@ static int fault_handler(lua_State *L)
 /* The arguments, all functions, become the first tasks. */
 static int l_run(lua_State *L)
 {
+	struct anchor *anchor;
 	struct loop *lp = get_loop(L);
 	int n = lua_gettop(L);
 	const struct zbus_observer *sub = check_rx(L)->ctx->sub;
@@ -900,11 +1234,19 @@ static int l_run(lua_State *L)
 		luaL_checktype(L, i, LUA_TFUNCTION);
 	}
 
+	anchor = anchor_get(L);
 	lp = lua_newuserdatauv(L, sizeof(*lp), 0);
 	memset(lp, 0, sizeof(*lp));
 	lp->current = -1;
-	lp->readers = check_rx(L)->ctx->readers;
+	lp->rx = check_rx(L);
+	lp->readers = lp->rx->ctx->readers;
+#ifdef CONFIG_LUA_ASYNC_STATS
+	lp->stats = lp->rx->ctx->stats;
+	memset(lp->stats, 0, sizeof(*lp->stats));
+	lp->stats->cyc_hz = stat_hz();
+#endif
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &loop_key);
+	anchor->lp = lp;
 
 	for (int i = 1; i <= n; i++) {
 		lua_pushvalue(L, i);
@@ -913,7 +1255,13 @@ static int l_run(lua_State *L)
 
 	lua_pushcfunction(L, fault_handler);
 	lua_pushcfunction(L, loop_body);
+#ifdef CONFIG_LUA_ASYNC_STATS
+	lp->run_t0 = stat_now();
+#endif
 	st = lua_pcall(L, 0, 0, -2);
+#ifdef CONFIG_LUA_ASYNC_STATS
+	lp->stats->cyc_total = stat_since(lp->run_t0);
+#endif
 	lp->current = -1;
 
 	if (st != LUA_OK) {
@@ -953,37 +1301,47 @@ static int l_run(lua_State *L)
 			ch->key = NULL;
 		}
 	}
+#if CONFIG_LUA_ASYNC_CORO_POOL > 0
+	for (int i = 0; i < lp->npool; i++) {
+		luaL_unref(L, LUA_REGISTRYINDEX, lp->pool[i].ref);
+	}
+	lp->npool = 0;
+#endif
 	lua_pushnil(L);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &loop_key);
+	anchor->lp = NULL;
 
 	lua_pushinteger(L, st != LUA_OK ? -EFAULT : busy ? -EBUSY : 0);
 	return 1;
 }
 
-static void check_parkable(lua_State *L)
+/*
+ * Records the parking request of the current task. When the task cannot
+ * yield, nothing is recorded and the caller's lua_yield raises its usual
+ * error, so a request is only ever left behind by a real yield.
+ */
+static void set_request(lua_State *L, struct loop *lp, int kind, int target, int32_t ms)
 {
-	struct loop *lp = get_loop(L);
+	struct task *t = &lp->tasks[lp->current];
 
 	/* From a nested coroutine the yield would reach its resumer, not the scheduler. */
-	if (L != lp->tasks[lp->current].co) {
+	if (L != t->co) {
 		luaL_error(L, "async: cannot park inside a coroutine");
 	}
+	if (!lua_isyieldable(L)) {
+		return;
+	}
+	t->req = (uint8_t)kind;
+	t->req_target = (int16_t)target;
+	t->req_ms = ms;
 }
 
-static int request(lua_State *L, int kind, int a, int32_t b, int nargs)
+/* lp comes from the binding's single up_loop() call, already checked by cur_slot(). */
+static int request(lua_State *L, struct loop *lp, int kind, int target, int32_t ms)
 {
-	check_parkable(L);
+	set_request(L, lp, kind, target, ms);
 
-	lua_pushlightuserdata(L, REQ);
-	lua_pushinteger(L, kind);
-	if (nargs >= 1) {
-		lua_pushinteger(L, a);
-	}
-	if (nargs >= 2) {
-		lua_pushinteger(L, b);
-	}
-
-	return lua_yield(L, 2 + nargs);
+	return lua_yield(L, 0);
 }
 
 static int l_spawn(lua_State *L)
@@ -994,7 +1352,7 @@ static int l_spawn(lua_State *L)
 	int slot;
 
 	luaL_checktype(L, 1, LUA_TFUNCTION);
-	lp = get_loop(L);
+	lp = up_loop(L);
 	if (lp == NULL) {
 		return luaL_error(L, "async: not running under the scheduler");
 	}
@@ -1019,19 +1377,23 @@ static int l_sleep(lua_State *L)
 {
 	int32_t ms = check_timeout(L, 1, "async.sleep", false);
 
-	(void)cur_slot(L, get_loop(L));
+	struct loop *lp = up_loop(L);
+
+	(void)cur_slot(L, lp);
 	if (ms == 0) {
-		return request(L, KIND_YIELD, 0, 0, 0);
+		return request(L, lp, KIND_YIELD, -1, 0);
 	}
 
-	return request(L, KIND_SLEEP, ms, 0, 1);
+	return request(L, lp, KIND_SLEEP, -1, ms);
 }
 
 static int l_yield(lua_State *L)
 {
-	(void)cur_slot(L, get_loop(L));
+	struct loop *lp = up_loop(L);
 
-	return request(L, KIND_YIELD, 0, 0, 0);
+	(void)cur_slot(L, lp);
+
+	return request(L, lp, KIND_YIELD, -1, 0);
 }
 
 static struct handle *check_handle(lua_State *L)
@@ -1060,7 +1422,7 @@ static int l_join(lua_State *L)
 {
 	struct handle *h = check_handle(L);
 	int32_t ms = check_timeout(L, 2, "join", true);
-	struct loop *lp = get_loop(L);
+	struct loop *lp = up_loop(L);
 	int cur = cur_slot(L, lp);
 
 	if (h->final != H_LIVE) {
@@ -1075,13 +1437,13 @@ static int l_join(lua_State *L)
 		return 2;
 	}
 
-	return request(L, KIND_JOIN, h->slot, ms, 2);
+	return request(L, lp, KIND_JOIN, h->slot, ms);
 }
 
 static int l_cancel(lua_State *L)
 {
 	struct handle *h = check_handle(L);
-	struct loop *lp = get_loop(L);
+	struct loop *lp = up_loop(L);
 	int slot = h->slot;
 	bool failed;
 
@@ -1115,7 +1477,7 @@ static int l_status(lua_State *L)
 	static const char *const states[] = {"free",    "ready",   "running", "sleeping",
 					     "waiting", "joining", "locking"};
 	struct handle *h = check_handle(L);
-	struct loop *lp = get_loop(L);
+	struct loop *lp = up_loop(L);
 
 	if (h->final != H_LIVE) {
 		lua_pushstring(L, finals[h->final]);
@@ -1134,7 +1496,7 @@ static void push_deadline(lua_State *L, int32_t ms)
 	if (ms < 0) {
 		lua_pushnil(L);
 	} else {
-		lua_pushinteger(L, (lua_Integer)(int32_t)((uint32_t)uptime() + (uint32_t)ms));
+		lua_pushinteger(L, (lua_Integer)wrap_add(uptime(), (uint32_t)ms));
 	}
 }
 
@@ -1146,7 +1508,7 @@ static int32_t time_left(lua_State *L, int idx)
 	if (lua_isnil(L, idx)) {
 		return -1;
 	}
-	left = (int32_t)((uint32_t)lua_tointeger(L, idx) - (uint32_t)uptime());
+	left = wrap_diff((uint32_t)lua_tointeger(L, idx), (uint32_t)uptime());
 
 	return left > 0 ? left : 0;
 }
@@ -1154,48 +1516,48 @@ static int32_t time_left(lua_State *L, int idx)
 static int park_on_lock(lua_State *L, const struct zbus_channel *chan, int32_t left,
 			lua_KContext ctx, lua_KFunction k)
 {
-	check_parkable(L);
-	lua_pushlightuserdata(L, REQ);
-	lua_pushinteger(L, KIND_LOCK);
-	lua_pushlightuserdata(L, (void *)chan);
-	lua_pushinteger(L, left);
+	struct loop *lp = up_loop(L);
 
-	return lua_yieldk(L, 4, ctx, k);
+	set_request(L, lp, KIND_LOCK, -1, left);
+	lp->tasks[lp->current].lock_chan = chan;
+
+	return lua_yieldk(L, 0, ctx, k);
 }
 
-static int await_try(lua_State *L);
+static int await_try(lua_State *L, struct loop *lp, const struct zbus_channel *chan);
 
+/* Continuation after a lock wait; ctx carries the channel l_await resolved. */
 static int await_k(lua_State *L, int status, lua_KContext ctx)
 {
 	ARG_UNUSED(status);
-	ARG_UNUSED(ctx);
 
 	if (lua_gettop(L) > 2) { /* expire() replied nil, -EAGAIN */
 		return 2;
 	}
 
-	return await_try(L);
+	return await_try(L, up_loop(L), (const struct zbus_channel *)(intptr_t)ctx);
 }
 
-/* One attempt of await; the stack is 1 chan, 2 deadline or nil (forever). */
-static int await_try(lua_State *L)
+/*
+ * One attempt of await; the stack is 1 chan, 2 deadline or nil (forever).
+ * chan is stack slot 1 already resolved, so it is not checked again.
+ */
+static int await_try(lua_State *L, struct loop *lp, const struct zbus_channel *chan)
 {
-	struct loop *lp = get_loop(L);
 	int slot = cur_slot(L, lp);
-	const struct zbus_channel *chan = to_chan(L, 1);
 	int32_t left = time_left(L, 2);
 	struct luaz_async_reader *rd;
 	struct chan *ch;
 	int c;
 
-	c = chan_get(L, lp, 1);
+	c = chan_get(L, lp, chan, 1);
 	if (c < 0) {
 		return luaL_error(L, "await: cannot watch '%s' (%d)", zbus_chan_name(chan),
 				  -ENOMEM);
 	}
 	ch = &lp->chans[c];
 	if (!ch->watched) {
-		int rc = zbus_chan_add_obs(chan, check_rx(L)->ctx->sub, K_NO_WAIT);
+		int rc = zbus_chan_add_obs(chan, lp->rx->ctx->sub, K_NO_WAIT);
 
 		if (rc == -EBUSY) {
 			if (left == 0) {
@@ -1203,7 +1565,7 @@ static int await_try(lua_State *L)
 				lua_pushinteger(L, -EAGAIN);
 				return 2;
 			}
-			return park_on_lock(L, chan, left, 0, await_k);
+			return park_on_lock(L, chan, left, (lua_KContext)(intptr_t)chan, await_k);
 		}
 		/* -EALREADY: left registered by an earlier run. */
 		if (rc != 0 && rc != -EALREADY) {
@@ -1224,10 +1586,10 @@ static int await_try(lua_State *L)
 	}
 
 	for (bool drained = false;; drained = true) {
-		if ((int32_t)(ch->head - rd->cursor) > 0) {
+		if (wrap_diff(ch->head, rd->cursor) > 0) {
 			uint32_t nxt = rd->cursor + 1;
 
-			if ((int32_t)(ch->low - nxt) > 0) { /* overwritten while away */
+			if (wrap_diff(ch->low, nxt) > 0) { /* overwritten while away */
 				rd->drops += ch->low - nxt;
 				nxt = ch->low;
 			}
@@ -1236,7 +1598,7 @@ static int await_try(lua_State *L)
 			return 1;
 		}
 		if (left != 0) {
-			return request(L, KIND_AWAIT, c, left, 2);
+			return request(L, lp, KIND_AWAIT, c, left);
 		}
 		if (drained) {
 			break;
@@ -1253,8 +1615,9 @@ static int l_await(lua_State *L)
 {
 	int32_t ms = check_timeout(L, 2, "await", true);
 	const struct zbus_channel *chan = to_chan(L, 1);
+	struct loop *lp = up_loop(L);
 
-	(void)cur_slot(L, get_loop(L));
+	(void)cur_slot(L, lp);
 	if (chan == NULL) {
 		return luaL_typeerror(L, 1, "zbus channel");
 	}
@@ -1265,7 +1628,7 @@ static int l_await(lua_State *L)
 	lua_settop(L, 1);
 	push_deadline(L, ms);
 
-	return await_try(L);
+	return await_try(L, lp, chan);
 }
 
 static int l_queue_depth(lua_State *L)
@@ -1285,19 +1648,18 @@ static int l_queue_depth(lua_State *L)
 			return luaL_error(L, "queue_depth: depth must be an integer >= 1");
 		}
 	}
-	lp = get_loop(L);
+	lp = up_loop(L);
 	if (lp == NULL) {
 		return luaL_error(L, "async: not running under the scheduler");
 	}
-	c = chan_get(L, lp, 1);
+	c = chan_get(L, lp, to_chan(L, 1), 1);
 	if (c < 0) {
 		return luaL_error(L,
 				  "queue_depth: too many channels (CONFIG_LUA_ASYNC_MAX_CHANNELS)");
 	}
 	ch = &lp->chans[c];
-	if (n > 0) {
-		ch->depth = (int)n;
-		ring_trim(L, ch);
+	if (n > 0 && n != ch->depth) {
+		ring_resize(L, ch, n);
 	}
 	lua_pushinteger(L, ch->depth);
 
@@ -1306,7 +1668,7 @@ static int l_queue_depth(lua_State *L)
 
 static int l_dropped(lua_State *L)
 {
-	struct loop *lp = get_loop(L);
+	struct loop *lp = up_loop(L);
 	int slot = cur_slot(L, lp);
 	const struct zbus_channel *key = to_chan(L, 1);
 	struct luaz_async_reader *rd;
@@ -1320,7 +1682,7 @@ static int l_dropped(lua_State *L)
 	rd = c >= 0 ? find_reader(&lp->tasks[slot], c) : NULL;
 	if (rd != NULL) {
 		/* Overwritten but not yet skipped; the next await counts it once. */
-		int32_t gap = (int32_t)(lp->chans[c].low - (rd->cursor + 1));
+		int32_t gap = wrap_diff(lp->chans[c].low, rd->cursor + 1U);
 
 		n = rd->drops;
 		if (gap > 0) {
@@ -1391,7 +1753,7 @@ static int lock_op_try(lua_State *L, lua_KContext ctx)
 
 static int start_lock_op(lua_State *L, const char *fname, int timeout_idx, lua_KContext ctx)
 {
-	struct loop *lp = get_loop(L);
+	struct loop *lp = up_loop(L);
 	const struct zbus_channel *chan = to_chan(L, 1);
 	size_t size;
 	int32_t ms;
@@ -1436,6 +1798,43 @@ static int l_read_async(lua_State *L)
 	return start_lock_op(L, "read_async", 2, 0);
 }
 
+#ifdef CONFIG_LUA_ASYNC_STATS
+/* async.stats() -> table of the current run's counters */
+static int l_stats(lua_State *L)
+{
+	struct loop *lp = up_loop(L);
+	const struct luaz_async_stats *st;
+
+	(void)cur_slot(L, lp);
+	/* The run is still going: report the time so far. */
+	lp->stats->cyc_total = stat_since(lp->run_t0);
+	st = lp->stats;
+
+	lua_createtable(L, 0, 15);
+#define STAT_FIELD(_f)                                                                             \
+	lua_pushinteger(L, (lua_Integer)st->_f);                                                   \
+	lua_setfield(L, -2, #_f)
+	STAT_FIELD(passes);
+	STAT_FIELD(resumes);
+	STAT_FIELD(wakes);
+	STAT_FIELD(idle_waits);
+	STAT_FIELD(msgs);
+	STAT_FIELD(decodes);
+	STAT_FIELD(scans);
+	STAT_FIELD(co_reuses);
+	STAT_FIELD(cyc_hz);
+	STAT_FIELD(cyc_total);
+	STAT_FIELD(cyc_resume);
+	STAT_FIELD(cyc_idle);
+	STAT_FIELD(cyc_drain);
+	STAT_FIELD(cyc_expire);
+	STAT_FIELD(cyc_locks);
+#undef STAT_FIELD
+
+	return 1;
+}
+#endif
+
 static const luaL_Reg handle_methods[] = {
 	{"join", l_join},
 	{"cancel", l_cancel},
@@ -1449,18 +1848,22 @@ static const luaL_Reg chan_methods[] = {
 };
 
 static const luaL_Reg module_funcs[] = {
-	{"spawn", l_spawn},
-	{"sleep", l_sleep},
-	{"yield", l_yield},
+	{"spawn", l_spawn}, {"sleep", l_sleep}, {"yield", l_yield},
+#ifdef CONFIG_LUA_ASYNC_STATS
+	{"stats", l_stats},
+#endif
 	{NULL, NULL},
 };
 
 static int luaz_async_open(lua_State *L)
 {
+	(void)anchor_get(L);
+
 	if (luaL_newmetatable(L, HANDLE_MT)) {
 		lua_pushvalue(L, -1);
 		lua_setfield(L, -2, "__index");
-		luaL_setfuncs(L, handle_methods, 0);
+		lua_rawgetp(L, LUA_REGISTRYINDEX, &anchor_key);
+		luaL_setfuncs(L, handle_methods, 1);
 	}
 	lua_pop(L, 1);
 
@@ -1469,12 +1872,38 @@ static int luaz_async_open(lua_State *L)
 		lua_pushvalue(L, -1);
 		lua_setfield(L, -2, "__index");
 	}
-	luaL_setfuncs(L, chan_methods, 0);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &anchor_key);
+	lua_pushvalue(L, -2);
+	luaL_setfuncs(L, chan_methods, 2);
 	lua_pop(L, 1);
 
-	luaL_newlib(L, module_funcs);
+	luaL_newlibtable(L, module_funcs);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &anchor_key);
+	luaL_setfuncs(L, module_funcs, 1);
 
 	return 1;
+}
+
+int luaz_async_coroutine_running(lua_State *L)
+{
+	struct loop *lp = get_loop(L);
+	int ismain = lua_pushthread(L);
+
+	/*
+	 * Mark the task that owns the calling coroutine, which is not always the
+	 * current one: a cancelled or failed task's __close handlers run on its
+	 * coroutine while another task (or none) is current. A nested coroutine
+	 * belongs to no task and is never pooled anyway.
+	 */
+	for (int s = 0; lp != NULL && s < MAX_TASKS; s++) {
+		if (lp->tasks[s].state != T_FREE && lp->tasks[s].co == L) {
+			lp->tasks[s].escaped = 1U;
+			break;
+		}
+	}
+	lua_pushboolean(L, ismain);
+
+	return 2;
 }
 
 void luaz_async_warn_blocking(lua_State *L, const char *fn)
@@ -1523,7 +1952,6 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	size_t buf_size = luaz_zbus_max_msg_size();
 	const struct zbus_observer *sub = ctx->sub;
 	const struct zbus_channel *chan;
-	struct loop *outer;
 	struct rx *c;
 	int ret = 0;
 
@@ -1532,7 +1960,21 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 		lua_settop(L, fn_idx - 1);
 		return -ENOMEM;
 	}
-	outer = get_loop(L);
+	if (get_loop(L) != NULL) {
+		/*
+		 * Refuse before touching anything the running scheduler owns: its rx
+		 * userdata (cached as lp->rx), its channel registrations, its timer.
+		 */
+		printk("[%s] async: scheduler already running\n",
+		       k_thread_name_get(k_current_get()));
+		lua_settop(L, fn_idx - 1);
+		return -EALREADY;
+	}
+#if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
+	/* Reference-counted: paired with the timing_stop() before the return below. */
+	timing_init();
+	timing_start();
+#endif
 
 	c = lua_newuserdatauv(L, sizeof(*c) + buf_size, 0);
 	c->ctx = ctx;
@@ -1549,6 +1991,11 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	zbus_iterate_over_channels_with_user_data(unwatch_now, (void *)sub);
 	(void)zbus_obs_set_enable(sub, true);
 
+	/* The idle timer is initialized statically (LUAZ_ASYNC_DEFINE); only reset it. */
+	k_timer_stop(ctx->timer);
+	k_timer_user_data_set(ctx->timer, ctx->tick);
+	k_poll_signal_reset(ctx->tick);
+
 	lua_pushcfunction(L, l_run);
 	lua_insert(L, fn_idx); /* l_run, f1 ... fn: the call consumes the functions */
 	if (lua_pcall(L, n, 1, 0) != LUA_OK) {
@@ -1558,12 +2005,15 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 		/* l_run did not get to unwatch its channels or retire every task. */
 		(void)zbus_obs_set_enable(sub, false);
 		zbus_iterate_over_channels_with_user_data(unwatch_now, (void *)sub);
-		if (lp != NULL && lp != outer) {
+		if (lp != NULL) {
 			for (int s = 0; s < MAX_TASKS; s++) {
 				free_readers(lp, &lp->tasks[s]);
 			}
 			lua_pushnil(L);
 			lua_rawsetp(L, LUA_REGISTRYINDEX, &loop_key);
+			if (anchor_find(L) != NULL) {
+				anchor_find(L)->lp = NULL;
+			}
 		}
 		ret = -EFAULT;
 	} else {
@@ -1573,12 +2023,15 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	/* Leave the subscriber clean for the next run, even after a fault. */
 	while (zbus_sub_wait_msg(sub, &chan, c->buf, K_NO_WAIT) == 0) {
 	}
+	k_timer_stop(ctx->timer);
 	lua_pushnil(L);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &rx_key);
 
 	lua_settop(L, fn_idx - 1);
-	__ASSERT(outer != NULL || k_mem_slab_num_used_get(ctx->readers) == 0,
-		 "async: readers left in the slab");
+	__ASSERT(k_mem_slab_num_used_get(ctx->readers) == 0, "async: readers left in the slab");
+#if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
+	timing_stop();
+#endif
 
 	return ret;
 }

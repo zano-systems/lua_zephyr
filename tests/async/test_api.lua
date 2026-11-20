@@ -163,4 +163,66 @@ return {
 		end)
 		T.same(seen, { "ready", "sleeping", "running", "done", "failed" })
 	end },
+
+	{ "async.stats() reports live totals during a run", function(T)
+		local async = T.start({ stats = 1 })
+		local s1, s2
+		async._run(function()
+			s1 = async.stats()
+			for _ = 1, 10 do
+				async.yield()
+			end
+			async.sleep(2)
+			s2 = async.stats()
+		end)
+		T.ok(s2.cyc_total > s1.cyc_total, "cyc_total grows during the run")
+		T.ok(s2.resumes >= s1.resumes + 11, "resumes counted")
+		T.ok(s2.passes > s1.passes, "passes counted")
+		T.ok(s2.idle_waits > s1.idle_waits, "idle wait counted")
+	end },
+
+	{ "allocator stats: reset, failure, alloc and free", function(T)
+		local _, F = T.start({ stats = 1 })
+		T.eq(F.alloc_check(), "ok")
+	end },
+
+	{ "finished task coroutines are reused, escaped ones are not", function(T)
+		local async = T.start({ stats = 1 })
+		local reuses = {}
+		async._run(function()
+			local function count() return async.stats().co_reuses end
+			local n0 = count()
+			async.spawn(function() end):join() -- fills the pool
+			async.spawn(function() end):join()
+			reuses.normal = count() - n0
+			n0 = count()
+			async.spawn(function() error("x", 0) end):join()
+			async.spawn(function() end):join()
+			reuses.after_error = count() - n0
+			n0 = count()
+			local h = async.spawn(function() async.sleep(100) end)
+			async.yield()
+			h:cancel()
+			async.spawn(function() end):join()
+			reuses.after_cancel = count() - n0
+			-- drain the pool, then show an escaped coroutine is not added back
+			local a = async.spawn(function() async.sleep(5) end)
+			local b = async.spawn(function() async.sleep(5) end)
+			a:join(); b:join() -- the pool is full (2) again
+			local c = async.spawn(function() async.sleep(5) end)
+			local d = async.spawn(function() async.sleep(5) end)
+			n0 = count()
+			async.spawn(function() coroutine.running() end):join() -- escaped: not pooled
+			c:join(); d:join()
+			local e = async.spawn(function() async.sleep(5) end)
+			local f = async.spawn(function() async.sleep(5) end)
+			local g = async.spawn(function() async.sleep(5) end)
+			reuses.escaped = count() - n0 -- e, f reuse c, d; g gets a new one
+			e:join(); f:join(); g:join()
+		end)
+		T.ok(reuses.normal >= 1, "a finished coroutine is reused")
+		T.ok(reuses.after_error >= 1, "reused after an error")
+		T.ok(reuses.after_cancel >= 1, "reused after a cancel")
+		T.eq(reuses.escaped, 2, "only the two clean coroutines were reused")
+	end },
 }

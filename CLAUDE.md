@@ -41,6 +41,8 @@ The `zephyr.async` scheduler has its own suite in `tests/async` (`testcase.yaml`
 west twister -p native_sim -T tests -O /tmp/lua_tests_native/
 ```
 
+Scheduler benchmarks live in `tests/async_bench` (cycles/op, allocs/op, heap peak; `.breakdown` adds the phase split). Run `just bench-device` (board in `hardware_map.yaml`; DWT cycles) or `just bench` (QEMU, counts only), and compare two logs with `scripts/bench_table.py`. `CONFIG_BENCH_PROFILE="<case>"` + `scripts/pc_sample.py` gives a function-level profile over J-Link. On boards with `tests/async_bench/baselines/<board>.lua` (nRF52833 only), a case more than `CONFIG_BENCH_MARGIN_PCT` (10%) slower than its baseline fails the run; refresh it with `bench_table.py --emit-baseline <log>` after an intended change.
+
 ### Formatting
 
 ```sh
@@ -157,7 +159,7 @@ Deeper nesting (3+ levels) works the same way — always define leaf types first
 | `CONFIG_LUA_LIB_MATH`            | if ALL   | Lua math library                                                   |
 | `CONFIG_LUA_LIB_COROUTINE`       | if ALL   | Lua coroutine library                                              |
 | `CONFIG_LUA_LIB_UTF8`            | if ALL   | Lua utf8 library                                                   |
-| `CONFIG_LUA_LIB_DEBUG`           | if ALL   | Lua debug library                                                  |
+| `CONFIG_LUA_LIB_DEBUG`           | if ALL   | Lua debug library (lets scripts forge C objects: keep off for untrusted scripts) |
 | `CONFIG_LUA_LIB_ZBUS`            | if ALL   | Include zbus bindings as `zephyr.zbus` subtable                    |
 | `CONFIG_LUA_PRECOMPILE`          | `n`      | Precompile scripts to bytecode at build time                       |
 | `CONFIG_LUA_PRECOMPILE_ONLY`     | `n`      | Exclude Lua parser (~15-20 KB savings)                             |
@@ -170,6 +172,9 @@ Deeper nesting (3+ levels) works the same way — always define leaf types first
 | `CONFIG_LUA_ASYNC_CHAN_QUEUE_DEPTH` | `4`   | Default messages kept per awaited channel                          |
 | `CONFIG_LUA_ASYNC_MAX_DRAIN`     | `16`     | Messages taken from zbus per scheduler pass                        |
 | `CONFIG_LUA_ASYNC_THREAD_STACK_SIZE` | `4096` | Default stack size of async threads                            |
+| `CONFIG_LUA_ASYNC_CORO_POOL`     | `2`      | Finished task coroutines reused by `spawn`; never one that called `coroutine.running()` (0 disables) |
+| `CONFIG_LUA_ASYNC_STATS`         | `n`      | Scheduler counters + per-phase cycles (`async.stats()`)            |
+| `CONFIG_LUA_ALLOC_STATS`         | `n`      | Allocator counters (`luaz_alloc_stats_get()`)                      |
 | `CONFIG_LUA_FS`                  | `n`      | Enable filesystem support                                          |
 | `CONFIG_LUA_FS_MOUNT_POINT`      | `"/lfs"` | Filesystem mount point prefix                                      |
 | `CONFIG_LUA_FS_MAX_FILE_SIZE`    | `4096`   | Maximum script file size (bytes)                                   |

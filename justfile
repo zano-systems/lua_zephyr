@@ -88,6 +88,20 @@ test-device sample="":
     rm -rf /tmp/lua_tests
     west twister -T samples/{{ sample }} --device-testing --hardware-map hardware_map.yaml --inline-logs -O /tmp/lua_tests
 
+# ── Benchmarks ───────────────────────────────────────────────────────────────────
+
+# Run the zephyr.async benchmarks on an emulated platform and print the tables
+bench platform="mps2/an385":
+    rm -rf /tmp/lua_bench
+    west twister -c -p {{ platform }} -T tests/async_bench -O /tmp/lua_bench
+    for f in $(find /tmp/lua_bench -name handler.log); do echo "## $f"; python3 scripts/bench_table.py "$f"; done
+
+# Run the zephyr.async benchmarks on the board in hardware_map.yaml
+bench-device:
+    rm -rf /tmp/lua_bench_dev
+    west twister -c -T tests/async_bench --device-testing --hardware-map hardware_map.yaml -O /tmp/lua_bench_dev
+    for f in $(find /tmp/lua_bench_dev -name handler.log -o -name device.log); do echo "## $f"; python3 scripts/bench_table.py "$f"; done
+
 # ── Code Quality ─────────────────────────────────────────────────────────────────
 
 # Format project C/H files (excludes core Lua sources)

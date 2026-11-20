@@ -101,6 +101,11 @@ config LUA_LIB_DEBUG
     help
       Preload the Lua debug library.
 
+      The debug library lets a script replace upvalues and metatables of
+      C objects (debug.setupvalue, debug.setmetatable), which can make a
+      C binding read one object as another. Leave it disabled in builds
+      that run untrusted scripts; LUA_LIBS_ALL enables it.
+
 config LUA_LIB_ZBUS
     bool "Lua zbus library"
     default y if LUA_LIBS_ALL
@@ -129,6 +134,14 @@ config LUA_EXTRA_OPTIMIZATIONS
       Reduce Lua internal data structure sizes for lower heap usage.
       Saves ~636 bytes per lua_newstate on 32-bit targets by reducing
       the string table initial size (128->64) and string cache (53x2->11x1).
+
+config LUA_ALLOC_STATS
+    bool "Count Lua allocator calls"
+    help
+      Count allocations, frees, reallocations and requested bytes in
+      lua_zephyr_allocator() across all Lua states. Read them with
+      luaz_alloc_stats_get(). For profiling; adds atomic operations to
+      every allocation.
 
 config LUA_ASYNC
     bool "Cooperative async scheduler (zephyr.async)"
@@ -202,6 +215,30 @@ config LUA_ASYNC_THREAD_STACK_SIZE
     default 4096
     help
       Default stack size of threads with CONFIG_<NAME>_LUA_THREAD_ASYNC=y.
+
+config LUA_ASYNC_CORO_POOL
+    int "Finished task coroutines kept for reuse per async thread"
+    range 0 256
+    default 2
+    help
+      async.spawn reuses the coroutine of a finished task (reset with
+      lua_closethread) instead of creating one, which saves about 0.5 KB
+      of allocation and GC work per spawn. Each pooled coroutine stays
+      allocated until the run ends. A task that called
+      coroutine.running() is never pooled, so a stored reference never
+      aliases a later task; initial tasks are not pooled either. 0
+      disables the pool.
+
+config LUA_ASYNC_STATS
+    bool "Scheduler counters and per-phase cycle accounting"
+    imply TIMING_FUNCTIONS
+    help
+      Count scheduler passes, resumes, wakeups, delivered messages and
+      task-slot scans, and accumulate the cycles spent in each scheduler
+      phase. Read them with async.stats() or the stats pointer of the
+      context from LUAZ_ASYNC_DEFINE. Cycles come from the timing API
+      (DWT on Cortex-M) when TIMING_FUNCTIONS is available, else from
+      k_cycle_get_32(). For profiling only.
 
 endif # LUA_ASYNC
 

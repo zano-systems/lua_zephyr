@@ -82,6 +82,27 @@ void luaz_print_mem_usage(struct sys_heap *hp, size_t heap_size);
  */
 void *lua_zephyr_allocator(void *ud, void *ptr, size_t osize, size_t nsize);
 
+/** @brief Allocator counters (CONFIG_LUA_ALLOC_STATS), summed over all Lua states. */
+struct luaz_alloc_stats {
+	uint32_t allocs;   /**< new blocks */
+	uint32_t frees;    /**< released blocks */
+	uint32_t reallocs; /**< resized blocks */
+	uint32_t fails;    /**< requests the heap could not satisfy */
+	uint32_t bytes;    /**< bytes requested by allocs and growing reallocs */
+	uint32_t live;     /**< bytes held now (not reset) */
+	uint32_t peak;     /**< highest live since the last reset */
+};
+
+/**
+ * @brief Read the allocator counters.
+ *
+ * @param out  Filled with the counters; zeros without CONFIG_LUA_ALLOC_STATS.
+ */
+void luaz_alloc_stats_get(struct luaz_alloc_stats *out);
+
+/** @brief Reset the allocator counters; peak restarts from the current live bytes. */
+void luaz_alloc_stats_reset(void);
+
 /**
  * @brief Open the `zephyr` Lua library (msleep, printk, log_*, zbus, fs).
  *

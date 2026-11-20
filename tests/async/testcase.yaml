@@ -9,7 +9,7 @@ tests:
     harness_config:
       type: one_line
       regex:
-        - "async tests: 78 passed, 0 failed, 7 skipped"
+        - "async tests: 88 passed, 0 failed, 11 skipped"
   lua_zephyr.async.limits:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_CHANNELS=2
@@ -17,7 +17,7 @@ tests:
     harness_config:
       type: one_line
       regex:
-        - "async tests: 3 passed, 0 failed, 82 skipped"
+        - "async tests: 3 passed, 0 failed, 96 skipped"
   lua_zephyr.async.watch_fail:
     extra_configs:
       - CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_ALLOC_STATIC=y
@@ -26,25 +26,55 @@ tests:
     harness_config:
       type: one_line
       regex:
-        - "async tests: 3 passed, 0 failed, 82 skipped"
+        - "async tests: 3 passed, 0 failed, 96 skipped"
   lua_zephyr.async.readers:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_READERS=2
     harness_config:
       type: one_line
       regex:
-        - "async tests: 2 passed, 0 failed, 83 skipped"
+        - "async tests: 2 passed, 0 failed, 97 skipped"
   lua_zephyr.async.many:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_TASKS=64
     harness_config:
       type: one_line
       regex:
-        - "async tests: 2 passed, 0 failed, 83 skipped"
+        - "async tests: 2 passed, 0 failed, 97 skipped"
   lua_zephyr.async.lock_waits:
     extra_configs:
       - CONFIG_LUA_ASYNC_MAX_LOCK_WAITS=1
     harness_config:
       type: one_line
       regex:
-        - "async tests: 2 passed, 0 failed, 83 skipped"
+        - "async tests: 2 passed, 0 failed, 97 skipped"
+  lua_zephyr.async.obj_core:
+    extra_configs:
+      - CONFIG_OBJ_CORE=y
+      - CONFIG_OBJ_CORE_TIMER=y
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 2 passed, 0 failed, 97 skipped"
+  lua_zephyr.async.seq_wrap:
+    extra_args:
+      - EXTRA_CFLAGS=-DLUAZ_ASYNC_SEQ_START=0xFFFFFFFAU
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 88 passed, 0 failed, 11 skipped"
+  lua_zephyr.async.stats:
+    extra_configs:
+      - CONFIG_LUA_ASYNC_STATS=y
+      - CONFIG_LUA_ALLOC_STATS=y
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 4 passed, 0 failed, 95 skipped"
+  lua_zephyr.async.no_pool:
+    extra_configs:
+      - CONFIG_LUA_ASYNC_CORO_POOL=0
+    harness_config:
+      type: one_line
+      regex:
+        - "async tests: 88 passed, 0 failed, 11 skipped"

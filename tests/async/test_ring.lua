@@ -336,4 +336,64 @@ return {
 		local _, F = T.start()
 		T.raises(function() F.channel("c"):dropped() end, "not running under the scheduler")
 	end },
+
+	{ "depth-3 ring keeps payloads and drop counts through grow and shrink", function(T)
+		local async, F = T.start()
+		local got, done, phase = { a = {}, b = {} }, { a = 0, b = 0 }, 0
+		async._run(function()
+			local ch = F.channel("a")
+			ch:queue_depth(3)
+			local function reader(name)
+				got[name][1] = ch:await(200).i
+				for p = 1, 3 do
+					while phase < p do
+						async.sleep(1)
+					end
+					while true do
+						local m = ch:await(0)
+						if m == nil then
+							break
+						end
+						got[name][#got[name] + 1] = m.i
+					end
+					done[name] = p
+				end
+				got[name].drops = ch:dropped()
+			end
+			local function step(p)
+				phase = p
+				while done.a < p or done.b < p do
+					async.sleep(1)
+				end
+			end
+			local ra = async.spawn(reader, "a")
+			local rb = async.spawn(reader, "b")
+			async.yield() -- both readers park on their first await
+			for i = 1, 6 do
+				F.publish("a", { i = i }) -- 1 wakes both; 4, 5, 6 stay in 3 slots
+			end
+			async.yield()
+			step(1) -- read 4, 5, 6 (2, 3 dropped)
+			F.publish("a", { i = 7 })
+			F.publish("a", { i = 8 })
+			async.yield()
+			ch:queue_depth(5) -- grow: 6, 7, 8 move over
+			F.publish("a", { i = 9 })
+			F.publish("a", { i = 10 })
+			async.yield()
+			step(2) -- read 7..10
+			for i = 11, 14 do
+				F.publish("a", { i = i })
+			end
+			async.yield()
+			ch:queue_depth(2) -- shrink: only 13, 14 remain
+			step(3)
+			ra:join()
+			rb:join()
+		end)
+		for _, name in ipairs({ "a", "b" }) do
+			T.same(got[name], { 1, 4, 5, 6, 7, 8, 9, 10, 13, 14 }, "payloads of " .. name)
+			T.eq(got[name].drops, 4, "drops of " .. name)
+		end
+	end },
 }

@@ -95,4 +95,43 @@ return {
 		end)
 		T.ok(closed)
 	end },
+
+	{ "a nested run is refused without disturbing the running one", function(T)
+		local async, F = T.start()
+		local nested, got
+		local ok = async._run(function()
+			local ch = F.channel("a")
+			async.spawn(function() got = ch:await(200) end)
+			async.yield() -- the awaiter registers on the channel and parks
+			nested = async._run(function() end)
+			collectgarbage()
+			collectgarbage()
+			F.publish("a", { v = "still here" })
+		end)
+		T.ok(ok, "outer run completes")
+		T.eq(nested, false, "nested run refused")
+		T.eq(got and got.v, "still here", "outer run still receives")
+		T.eq(#F.reports, 1)
+		T.matches(F.reports[1], "^async: scheduler already running")
+	end },
+
+	{ "a binding with a replaced upvalue raises instead of misreading it", function(T)
+		local async = T.start()
+		local yield = async.yield
+		local _, anchor = debug.getupvalue(yield, 1)
+		local errs = {}
+		async._run(function()
+			local h = async.spawn(function() end) -- a userdata of another type
+			for _, fake in ipairs({ {}, h }) do
+				debug.setupvalue(yield, 1, fake)
+				local ok, err = pcall(yield)
+				debug.setupvalue(yield, 1, anchor)
+				errs[#errs + 1] = (not ok) and err or "no error"
+			end
+		end)
+		T.eq(#errs, 2)
+		for _, e in ipairs(errs) do
+			T.matches(e, "binding upvalue was replaced")
+		end
+	end },
 }

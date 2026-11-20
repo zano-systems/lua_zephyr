@@ -10,6 +10,7 @@
 
 #include <luaz_async.h>
 #include <luaz_msg_descr.h>
+#include <luaz_utils.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk-hooks.h>
@@ -160,6 +161,30 @@ static int l_hold(lua_State *L)
 	return 0;
 }
 
+/*
+ * testlib.publish_later(name, ms): the system workqueue publishes {v = "later"}
+ * on the channel after ms, waking a scheduler whose tasks are all parked.
+ */
+static const struct zbus_channel *later_chan;
+
+static void publish_later_work(struct k_work *work)
+{
+	struct t_msg msg = {.v = "later", .i = 0};
+
+	ARG_UNUSED(work);
+	(void)zbus_chan_pub(later_chan, &msg, K_MSEC(100));
+}
+
+static K_WORK_DELAYABLE_DEFINE(later_w, publish_later_work);
+
+static int l_publish_later(lua_State *L)
+{
+	later_chan = check_chan(L);
+	(void)k_work_schedule(&later_w, K_MSEC(luaL_checkinteger(L, 2)));
+
+	return 0;
+}
+
 /* testlib.watching(name) -> whether the suite's subscriber is on the channel */
 static int l_watching(lua_State *L)
 {
@@ -179,6 +204,99 @@ static int l_watching(lua_State *L)
 static int l_queued(lua_State *L)
 {
 	lua_pushboolean(L, !k_fifo_is_empty(suite_async_sub.message_fifo));
+
+	return 1;
+}
+
+#ifdef CONFIG_OBJ_CORE_TIMER
+/* Stops a walk that would not end (a cycle from a re-linked timer). */
+#define WALK_BOUND 1000
+
+struct timer_count {
+	int seen;
+	int visits;
+};
+
+static int count_timer(struct k_obj_core *obj_core, void *data)
+{
+	struct timer_count *tc = data;
+
+	if (obj_core == K_OBJ_CORE(&suite_async_timer)) {
+		tc->seen++;
+	}
+	tc->visits++;
+
+	return tc->visits < WALK_BOUND ? 0 : -1;
+}
+#endif
+
+/* testlib.timer_links() -> times the suite's idle timer is registered, -1 for
+ * an unbounded walk, or nil without CONFIG_OBJ_CORE_TIMER
+ */
+static int l_timer_links(lua_State *L)
+{
+#ifdef CONFIG_OBJ_CORE_TIMER
+	struct k_obj_type *type = k_obj_type_find(K_OBJ_TYPE_TIMER_ID);
+	struct timer_count tc = {0};
+
+	if (type == NULL) {
+		return luaL_error(L, "no timer object type");
+	}
+	(void)k_obj_type_walk_unlocked(type, count_timer, &tc);
+	lua_pushinteger(L, tc.visits >= WALK_BOUND ? -1 : tc.seen);
+#else
+	lua_pushnil(L);
+#endif
+
+	return 1;
+}
+
+/*
+ * testlib.alloc_check() -> "ok" or what failed. Drives the state's allocator
+ * directly, so no Lua allocation interleaves with the counters it checks.
+ */
+static int l_alloc_check(lua_State *L)
+{
+#ifdef CONFIG_LUA_ALLOC_STATS
+	void *ud;
+	lua_Alloc f = lua_getallocf(L, &ud);
+	struct luaz_alloc_stats a;
+	struct luaz_alloc_stats b;
+	void *p;
+
+	luaz_alloc_stats_reset();
+	luaz_alloc_stats_get(&a);
+	if (a.live == 0U || a.peak != a.live || a.allocs != 0U || a.bytes != 0U) {
+		lua_pushliteral(L, "reset must keep live bytes and set peak to them");
+		return 1;
+	}
+	if (f(ud, NULL, LUA_TSTRING, SIZE_MAX / 2U) != NULL) {
+		lua_pushliteral(L, "huge allocation succeeded");
+		return 1;
+	}
+	luaz_alloc_stats_get(&b);
+	if (b.fails != a.fails + 1U || b.allocs != a.allocs || b.bytes != a.bytes ||
+	    b.live != a.live || b.peak != a.peak) {
+		lua_pushliteral(L, "a failed allocation must only count as a failure");
+		return 1;
+	}
+	p = f(ud, NULL, LUA_TSTRING, 64U);
+	luaz_alloc_stats_get(&b);
+	if (p == NULL || b.allocs != 1U || b.bytes != 64U || b.live != a.live + 64U ||
+	    b.peak != a.live + 64U) {
+		lua_pushliteral(L, "an allocation must count bytes, live and peak");
+		return 1;
+	}
+	(void)f(ud, p, 64U, 0U);
+	luaz_alloc_stats_get(&b);
+	if (b.frees != 1U || b.live != a.live || b.peak != a.live + 64U) {
+		lua_pushliteral(L, "a free must lower live bytes and keep the peak");
+		return 1;
+	}
+	lua_pushliteral(L, "ok");
+#else
+	lua_pushnil(L);
+#endif
 
 	return 1;
 }
@@ -211,6 +329,12 @@ static int l_config(lua_State *L)
 	lua_pushinteger(L, COND_CODE_1(CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_ALLOC_STATIC,
 				       (CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_POOL_SIZE), (0)));
 	lua_setfield(L, -2, "node_pool");
+	lua_pushinteger(L, IS_ENABLED(CONFIG_OBJ_CORE_TIMER) ? 1 : 0);
+	lua_setfield(L, -2, "obj_core");
+	lua_pushinteger(L, IS_ENABLED(CONFIG_LUA_ASYNC_STATS) && IS_ENABLED(CONFIG_LUA_ALLOC_STATS)
+				   ? 1
+				   : 0);
+	lua_setfield(L, -2, "stats");
 
 	return 1;
 }
@@ -257,6 +381,9 @@ static int luaopen_testlib(lua_State *L)
 		{"readers", l_readers},
 		{"watching", l_watching},
 		{"queued", l_queued},
+		{"timer_links", l_timer_links},
+		{"publish_later", l_publish_later},
+		{"alloc_check", l_alloc_check},
 		{NULL, NULL},
 	};
 

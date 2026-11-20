@@ -14,6 +14,7 @@
 #ifdef CONFIG_LUA_LIB_ZBUS
 #include <luaz_zbus.h>
 #endif
+#include <string.h>
 #include <sys/times.h>
 #include <sys/types.h>
 #include <time.h>
@@ -30,6 +31,20 @@
 
 LOG_MODULE_REGISTER(lua_zephyr, CONFIG_LUA_ZEPHYR_LOG_LEVEL);
 
+#ifdef CONFIG_LUA_LIB_COROUTINE
+/* The coroutine library, with coroutine.running() tracking escapes for the async pool. */
+static int open_coroutine(lua_State *L)
+{
+	(void)luaopen_coroutine(L);
+#if defined(CONFIG_LUA_ASYNC) && CONFIG_LUA_ASYNC_CORO_POOL > 0
+	lua_pushcfunction(L, luaz_async_coroutine_running);
+	lua_setfield(L, -2, "running");
+#endif
+
+	return 1;
+}
+#endif
+
 /**
  * @brief The custom allocator that Lua will use to dynamically allocate all
 relevant data in the context
@@ -40,6 +55,77 @@ use
  * @param osize The old size of the memory region that ptr points to
  * @param nsize The desired new size of the memory region that ptr points to
  */
+#ifdef CONFIG_LUA_ALLOC_STATS
+static struct {
+	atomic_t allocs;
+	atomic_t frees;
+	atomic_t reallocs;
+	atomic_t fails;
+	atomic_t bytes;
+	atomic_t live;
+	atomic_t peak;
+} alloc_stats;
+
+/* Racy max: good enough for profiling. */
+static void alloc_stats_live(atomic_val_t delta)
+{
+	atomic_val_t live = atomic_add(&alloc_stats.live, delta) + delta;
+
+	if (live > atomic_get(&alloc_stats.peak)) {
+		atomic_set(&alloc_stats.peak, live);
+	}
+}
+
+/* With ptr == NULL, osize carries the object type, not a size. */
+static void alloc_stats_count(void *ptr, size_t osize, size_t nsize, void *res)
+{
+	if (nsize == 0) {
+		if (ptr != NULL) {
+			atomic_inc(&alloc_stats.frees);
+			alloc_stats_live(-(atomic_val_t)osize);
+		}
+	} else if (res == NULL) {
+		atomic_inc(&alloc_stats.fails);
+	} else if (ptr == NULL) {
+		atomic_inc(&alloc_stats.allocs);
+		atomic_add(&alloc_stats.bytes, (atomic_val_t)nsize);
+		alloc_stats_live((atomic_val_t)nsize);
+	} else {
+		atomic_inc(&alloc_stats.reallocs);
+		if (nsize > osize) {
+			atomic_add(&alloc_stats.bytes, (atomic_val_t)(nsize - osize));
+		}
+		alloc_stats_live((atomic_val_t)nsize - (atomic_val_t)osize);
+	}
+}
+#endif
+
+void luaz_alloc_stats_get(struct luaz_alloc_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+#ifdef CONFIG_LUA_ALLOC_STATS
+	out->allocs = (uint32_t)atomic_get(&alloc_stats.allocs);
+	out->frees = (uint32_t)atomic_get(&alloc_stats.frees);
+	out->reallocs = (uint32_t)atomic_get(&alloc_stats.reallocs);
+	out->fails = (uint32_t)atomic_get(&alloc_stats.fails);
+	out->bytes = (uint32_t)atomic_get(&alloc_stats.bytes);
+	out->live = (uint32_t)atomic_get(&alloc_stats.live);
+	out->peak = (uint32_t)atomic_get(&alloc_stats.peak);
+#endif
+}
+
+void luaz_alloc_stats_reset(void)
+{
+#ifdef CONFIG_LUA_ALLOC_STATS
+	atomic_clear(&alloc_stats.allocs);
+	atomic_clear(&alloc_stats.frees);
+	atomic_clear(&alloc_stats.reallocs);
+	atomic_clear(&alloc_stats.fails);
+	atomic_clear(&alloc_stats.bytes);
+	atomic_set(&alloc_stats.peak, atomic_get(&alloc_stats.live));
+#endif
+}
+
 void *lua_zephyr_allocator(void *ud, void *ptr, size_t osize, size_t nsize)
 {
 	void *res = NULL;
@@ -55,6 +141,10 @@ void *lua_zephyr_allocator(void *ud, void *ptr, size_t osize, size_t nsize)
 			printk("Something went wrong with allocation\n");
 		}
 	}
+
+#ifdef CONFIG_LUA_ALLOC_STATS
+	alloc_stats_count(ptr, osize, nsize, res);
+#endif
 
 	return res;
 }
@@ -328,7 +418,7 @@ void luaz_openlibs(lua_State *L)
 	lua_setfield(L, -2, "math");
 #endif
 #ifdef CONFIG_LUA_LIB_COROUTINE
-	lua_pushcfunction(L, luaopen_coroutine);
+	lua_pushcfunction(L, open_coroutine);
 	lua_setfield(L, -2, "coroutine");
 #endif
 #ifdef CONFIG_LUA_LIB_UTF8

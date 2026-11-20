@@ -145,4 +145,189 @@ return {
 		end)
 		T.matches(err, "task limit reached")
 	end },
+
+	{ "the idle timer is registered once across runs", function(T)
+		local async, F = T.start({ obj_core = 1 })
+		for _ = 1, 5 do
+			async._run(function() async.sleep(2) end)
+		end
+		T.eq(F.timer_links(), 1, "registrations of the idle timer")
+	end },
+
+	{ "an earlier deadline arriving while the idle timer is armed wakes first", function(T)
+		local async, F = T.start()
+		local woke, at = {}, nil
+		async._run(function()
+			local ch = F.channel("a")
+			async.spawn(function() async.sleep(50); woke.long = F.now end)
+			F.publish_later("a", 5)
+			-- Every task is parked now, so the idle timer is armed for 50 ms; only
+			-- the message from the workqueue wakes this task, at 5 ms.
+			ch:await()
+			at = F.now
+			async.spawn(function() async.sleep(10); woke.short = F.now end)
+		end)
+		T.ok(at >= 5 and at <= 6, "controller woke at the message (" .. tostring(at) .. ")")
+		T.ok(woke.short >= at + 10 and woke.short <= at + 11,
+			"the earlier deadline re-armed the timer (woke at " .. tostring(woke.short) .. ")")
+		T.eq(woke.long, 50, "the later deadline is unchanged")
+	end },
+
+	{ "cancelling the earliest sleeper while the idle timer is armed wakes no one early", function(T)
+		local async, F = T.start()
+		local woke_early, woke_late, cancelled
+		async._run(function()
+			local ch = F.channel("a")
+			local early = async.spawn(function() async.sleep(10); woke_early = F.now end)
+			async.spawn(function() async.sleep(30); woke_late = F.now end)
+			F.publish_later("a", 2)
+			ch:await() -- all parked: the idle timer is armed for 10 ms
+			cancelled = early:cancel()
+		end)
+		T.eq(cancelled, true)
+		T.eq(woke_early, nil, "cancelled sleeper never woke")
+		T.eq(woke_late, 30, "late sleeper woke at its own deadline")
+	end },
+
+	{ "equal deadlines wake together, in park order", function(T)
+		local async, F = T.start()
+		local log = {}
+		async._run(function()
+			for _, name in ipairs({ "a", "b", "c" }) do
+				async.spawn(function() async.sleep(10); log[#log + 1] = name .. "@" .. F.now end)
+			end
+		end)
+		T.same(log, { "a@10", "b@10", "c@10" })
+	end },
+
+	{ "a task that exposed its coroutine is never reused for another task", function(T)
+		local async = T.start()
+		local first, second
+		async._run(function()
+			async.spawn(function() first = coroutine.running() end):join()
+			async.spawn(function() second = coroutine.running() end):join()
+		end)
+		T.ok(first ~= nil and second ~= nil)
+		T.ok(first ~= second, "a stored coroutine.running() never aliases a later task")
+		T.eq(coroutine.status(first), "dead")
+	end },
+
+	{ "a reused coroutine starts clean after an error, a cancel and a <close>", function(T)
+		local async = T.start()
+		local closed = {}
+		local function closer(name)
+			return setmetatable({}, { __close = function() closed[name] = (closed[name] or 0) + 1 end })
+		end
+		local function fresh(...) -- checks it sees only its own arguments
+			local c <close> = closer("fresh")
+			return select("#", ...), ...
+		end
+		local results = {}
+		async._run(function()
+			-- an error, with a <close> pending
+			T.eq(async.spawn(function()
+				local c <close> = closer("err")
+				error("boom", 0)
+			end):join(), false)
+			results.after_error = table.pack(async.spawn(fresh, "a", nil):join())
+			-- a cancel while parked, with a <close> pending
+			local h = async.spawn(function()
+				local c <close> = closer("cancel")
+				async.sleep(100)
+			end)
+			async.yield()
+			T.eq(h:cancel(), true)
+			results.after_cancel = table.pack(async.spawn(fresh, 1, 2, 3):join())
+			-- a normal finish through a <close>, and a deep stack
+			local function deep(n) if n == 0 then return 0 end return 1 + deep(n - 1) end
+			T.eq(select(2, async.spawn(function()
+				local c <close> = closer("normal")
+				return deep(200)
+			end):join()), 200)
+			results.after_normal = table.pack(async.spawn(fresh):join())
+		end)
+		local function values(t)
+			local out = {}
+			for i = 1, t.n do
+				out[i] = tostring(t[i])
+			end
+			return out
+		end
+		T.same(values(results.after_error), { "true", "2", "a", "nil" }, "after an error")
+		T.same(values(results.after_cancel), { "true", "3", "1", "2", "3" }, "after a cancel")
+		T.same(values(results.after_normal), { "true", "0" }, "after a normal finish")
+		T.eq(closed.err, 1, "the failed task's <close> ran once")
+		T.eq(closed.cancel, 1, "the cancelled task's <close> ran once")
+		T.eq(closed.normal, 1, "the finished task's <close> ran once")
+		T.eq(closed.fresh, 3, "each new task ran only its own <close>")
+	end },
+
+	{ "a coroutine saved by a cancelled or failed task's <close> is never reused", function(T)
+		local async = T.start()
+		local status = {}
+		local function saver(name)
+			return setmetatable({}, { __close = function() status[name] = coroutine.running() end })
+		end
+		-- With the saved coroutine reused, a parked task would make it "suspended".
+		local function parked_status(name)
+			local next_task = async.spawn(function() async.sleep(20) end)
+			async.yield() -- next_task is parked now
+			local st = coroutine.status(status[name])
+			next_task:join()
+			return st
+		end
+		local results = {}
+		async._run(function()
+			local victim = async.spawn(function()
+				local c <close> = saver("cancelled")
+				async.sleep(100)
+			end)
+			async.yield()
+			victim:cancel() -- its <close> runs on its coroutine while this task is current
+			results.cancelled = parked_status("cancelled")
+			async.spawn(function()
+				local c <close> = saver("failed")
+				error("x", 0) -- its <close> runs after the task ended, with no task current
+			end):join()
+			results.failed = parked_status("failed")
+		end)
+		T.eq(results.cancelled, "dead", "coroutine saved during a cancel")
+		T.eq(results.failed, "dead", "coroutine saved during a failure")
+	end },
+
+	{ "debug hooks do not cross coroutine reuse", function(T)
+		local async = T.start()
+		local counts = { a = 0 }
+		local leaked, fresh_mask, child_mask
+		async._run(function()
+			-- A task that ends with a hook still set on its coroutine.
+			async.spawn(function()
+				debug.sethook(function() counts.a = counts.a + 1 end, "l")
+				local x = 1
+				x = x + 1
+			end):join()
+			local before = counts.a
+			async.spawn(function()
+				local y = 1
+				y = y + 1
+				y = y + 1
+			end):join()
+			leaked = counts.a - before
+		end)
+		-- A new run starts with an empty pool. A spawner with a hook: the new task
+		-- must start with the same hook state as a fresh coroutine (the C hook
+		-- and mask are inherited).
+		async._run(function()
+			async.spawn(function() end):join() -- leaves a clean coroutine in the pool
+			debug.sethook(function() end, "l")
+			local fresh = coroutine.create(function() return select(2, debug.gethook()) end)
+			fresh_mask = select(2, coroutine.resume(fresh))
+			local child = async.spawn(function() child_mask = select(2, debug.gethook()) end)
+			debug.sethook()
+			child:join()
+		end)
+		T.eq(leaked, 0, "a hook set by one task did not fire in the next")
+		T.eq(fresh_mask, "l")
+		T.eq(child_mask, fresh_mask, "a task spawned under a hook starts like a fresh coroutine")
+	end },
 }

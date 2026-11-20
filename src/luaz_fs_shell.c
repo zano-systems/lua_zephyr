@@ -273,6 +273,9 @@ static int cmd_delete(const struct shell *sh, size_t argc, char **argv)
 }
 
 /** @brief Shell command: lua_fs run <name> — execute a script in a temporary Lua state. */
+/* A k_heap, so heap viewers such as zview find it; Lua allocates from its sys_heap. */
+K_HEAP_DEFINE(lua_fs_run_heap, CONFIG_LUA_THREAD_HEAP_SIZE);
+
 static int cmd_run(const struct shell *sh, size_t argc, char **argv)
 {
 	if (argc < 2) {
@@ -280,12 +283,11 @@ static int cmd_run(const struct shell *sh, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
-	static char heap_buf[CONFIG_LUA_THREAD_HEAP_SIZE];
-	static struct sys_heap run_heap;
+	/* Start each run from an empty heap. */
+	sys_heap_init(&lua_fs_run_heap.heap, lua_fs_run_heap.heap.init_mem,
+		      lua_fs_run_heap.heap.init_bytes);
 
-	sys_heap_init(&run_heap, heap_buf, CONFIG_LUA_THREAD_HEAP_SIZE);
-
-	lua_State *L = lua_newstate(lua_zephyr_allocator, &run_heap, 0);
+	lua_State *L = lua_newstate(lua_zephyr_allocator, &lua_fs_run_heap.heap, 0);
 
 	if (L == NULL) {
 		shell_error(sh, "Failed to create Lua state");
