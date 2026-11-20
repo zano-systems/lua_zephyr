@@ -14,6 +14,19 @@ goes, and what the optimizations on `perf/async-scheduler` bought.
 | `scripts/pc_sample.py` | Statistical function-level profile over J-Link (PC + LR samples mapped to ELF symbols) | build `tests/async_bench` with `CONFIG_BENCH_PROFILE="<case>"`, flash, run the script |
 | zview | Thread CPU shares, Lua heap use and peak (each Lua heap is a `k_heap` named `<thread>_lua_heap`), stack watermarks, slab peaks, without instrumentation | `zview dump -e zephyr.elf -r jlink -t NRF52833_XXAA --json` |
 
+**Regression thresholds.** `tests/async_bench/baselines/<board>.lua` holds the
+expected cycles/op for each case and GC mode. When the file exists for the
+board, a case slower than baseline + `CONFIG_BENCH_MARGIN_PCT` (default 10%)
+fails the run with `BENCH FAIL <case> regressed: ...`. A case faster than
+baseline − margin prints `BENCH NOTE ... refresh the baseline`. The check is off
+in the `.breakdown` scenario and in profile mode. Only `nrf52833dk_nrf52833.lua`
+exists: emulated targets have no meaningful cycles. After an intended
+change, refresh it from a board run:
+
+```sh
+python3 scripts/bench_table.py --emit-baseline <handler.log> > tests/async_bench/baselines/nrf52833dk_nrf52833.lua
+```
+
 Cycle counts are only meaningful on hardware: the nRF52833 numbers use the DWT
 cycle counter (`CONFIG_TIMING_FUNCTIONS` and
 `CONFIG_THREAD_RUNTIME_STATS_USE_TIMING_FUNCTIONS`, from

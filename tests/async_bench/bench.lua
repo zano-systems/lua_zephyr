@@ -30,6 +30,33 @@ if PROFILE ~= "" then
 	end
 end
 
+-- Board baseline (baselines/<board>.lua): a case slower than baseline +
+-- CONFIG_BENCH_MARGIN_PCT fails the run. Not with stats, nor when profiling.
+local BASE = bench.baseline and PROFILE == "" and not bench.stats and load(bench.baseline)()
+if BASE then
+	local measure, set_gc = bench.measure, bench.gc
+	local gc_mode = "inc"
+	bench.gc = function(mode)
+		gc_mode = mode
+		return set_gc(mode)
+	end
+	bench.measure = function(name, ...)
+		local rc, cyc = measure(name, ...)
+		local base = BASE[name] and BASE[name][gc_mode]
+		if cyc and base then
+			local pct = (cyc - base) * 100 // base
+			if cyc * 100 > base * (100 + bench.margin) then
+				bench.fail(string.format("%s/%s regressed: %d cyc/op, baseline %d (%+d%%)",
+					name, gc_mode, cyc, base, pct))
+			elseif cyc * 100 < base * (100 - bench.margin) then
+				print(string.format("BENCH NOTE %s/%s: %d cyc/op, baseline %d (%+d%%), refresh the baseline",
+					name, gc_mode, cyc, base, pct))
+			end
+		end
+		return rc, cyc
+	end
+end
+
 -- Context switches: ntasks round-robin through async.yield().
 local function yield_bench(ntasks, iters)
 	local fns = {}

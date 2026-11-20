@@ -13,3 +13,12 @@ project(async_bench)
 luaz_generate_threads()
 
 target_sources(app PRIVATE src/benchlib.c)
+
+# Per-board cycles/op baseline (scripts/bench_table.py --emit-baseline).
+set(BENCH_BOARD "${NORMALIZED_BOARD_TARGET}")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/baselines/${BENCH_BOARD}.lua")
+    luaz_add_file(baselines/${BENCH_BOARD}.lua)
+    target_compile_definitions(app PRIVATE
+        BENCH_BASELINE=${BENCH_BOARD}_lua_script
+        "BENCH_BASELINE_HEADER=\"${BENCH_BOARD}_lua_script.h\"")
+endif()

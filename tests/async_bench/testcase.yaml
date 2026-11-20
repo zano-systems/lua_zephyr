@@ -8,7 +8,7 @@ common:
   integration_platforms:
     - mps2/an385
   harness: console
-  timeout: 300
+  timeout: 120
   harness_config:
     type: one_line
     regex:

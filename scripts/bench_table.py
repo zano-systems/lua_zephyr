@@ -4,6 +4,7 @@
 
     bench_table.py run.log                 # one run
     bench_table.py base.log new.log        # before/after with deltas
+    bench_table.py --emit-baseline run.log > tests/async_bench/baselines/<board>.lua
 
 Reads the BENCH (and STATS, when present) lines that benchlib.c prints; any
 other line is ignored, so twister handler.log files or raw serial captures work.
@@ -81,12 +82,39 @@ def compare(base, new, order):
         print(f"| {key[0]} | {key[1]} | " + " | ".join(cols) + " |")
 
 
+def emit_baseline(path):
+    bench, _, order = parse(path)
+    board = "?"
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = re.search(r"BENCH_INFO board=(\S+)", line)
+            if m:
+                board = m.group(1)
+                break
+    cases = {}
+    for name, gc in order:
+        cases.setdefault(name, {})[gc] = int(bench[(name, gc)]["cyc/op"])
+    print(f"-- cycles/op on {board}, from scripts/bench_table.py --emit-baseline.")
+    print("-- tests/async_bench fails a case slower than this + CONFIG_BENCH_MARGIN_PCT.")
+    print("return {")
+    for name, modes in cases.items():
+        fields = ", ".join(f"{gc} = {v}" for gc, v in modes.items())
+        print(f'\t["{name}"] = {{ {fields} }},')
+    print("}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="+", help="one log, or base and new logs")
+    ap.add_argument("--emit-baseline", action="store_true",
+                    help="print the log's cycles/op as a tests/async_bench baseline file")
     args = ap.parse_args()
-    if len(args.logs) == 1:
+    if args.emit_baseline:
+        if len(args.logs) != 1:
+            ap.error("--emit-baseline takes one log")
+        emit_baseline(args.logs[0])
+    elif len(args.logs) == 1:
         single(*parse(args.logs[0]))
     elif len(args.logs) == 2:
         base, _, order = parse(args.logs[0])

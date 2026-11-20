@@ -9,6 +9,9 @@
  *   BENCH <name> ops=<n> cyc=<c> cyc/op=<c> wall_us=<us> allocs/op=<a.aa>
  *         bytes/op=<b> peak=<bytes> gc=<mode> rc=<rc>
  *
+ * and returns rc and cyc/op, which bench.lua checks against the board's
+ * baseline.
+ *
  * cyc counts the Lua thread's own execution cycles (thread runtime stats), so
  * idle time and the publisher are left out. With CONFIG_LUA_ASYNC_STATS a
  * STATS line follows with the scheduler counters and the phase split.
@@ -29,6 +32,11 @@
 
 #ifdef CONFIG_TIMING_FUNCTIONS
 #include <zephyr/timing/timing.h>
+#endif
+
+/* CMake embeds baselines/<board>.lua when it exists (see CMakeLists.txt). */
+#ifdef BENCH_BASELINE
+#include BENCH_BASELINE_HEADER
 #endif
 
 struct bench_msg {
@@ -227,8 +235,9 @@ static int l_measure(lua_State *L)
 		failures++;
 	}
 	lua_pushinteger(L, rc);
+	lua_pushinteger(L, (lua_Integer)MIN(cyc / (uint64_t)ops, (uint64_t)INT32_MAX));
 
-	return 1;
+	return 2;
 }
 
 /* bench.publish(count, chan_name, ...): publish count messages round-robin */
@@ -261,11 +270,17 @@ static int l_fail(lua_State *L)
 	return 0;
 }
 
-/* bench.done(): print the summary line twister waits for */
+/*
+ * bench.done(): print the summary line twister waits for. On failure, stop
+ * with a fatal error, so twister reports a fault instead of a timeout.
+ */
 static int l_done(lua_State *L)
 {
 	ARG_UNUSED(L);
 	printk("bench done: %d failed\n", failures);
+	if (failures > 0) {
+		k_panic();
+	}
 
 	return 0;
 }
@@ -280,6 +295,14 @@ static int luaopen_bench(lua_State *L)
 	luaL_newlib(L, funcs);
 	lua_pushstring(L, CONFIG_BENCH_PROFILE);
 	lua_setfield(L, -2, "profile");
+#ifdef BENCH_BASELINE
+	lua_pushstring(L, BENCH_BASELINE);
+	lua_setfield(L, -2, "baseline");
+#endif
+	lua_pushinteger(L, CONFIG_BENCH_MARGIN_PCT);
+	lua_setfield(L, -2, "margin");
+	lua_pushboolean(L, IS_ENABLED(CONFIG_LUA_ASYNC_STATS));
+	lua_setfield(L, -2, "stats");
 
 	return 1;
 }
