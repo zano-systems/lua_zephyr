@@ -1797,7 +1797,6 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	size_t buf_size = luaz_zbus_max_msg_size();
 	const struct zbus_observer *sub = ctx->sub;
 	const struct zbus_channel *chan;
-	struct loop *outer;
 	struct rx *c;
 	int ret = 0;
 
@@ -1806,7 +1805,16 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 		lua_settop(L, fn_idx - 1);
 		return -ENOMEM;
 	}
-	outer = get_loop(L);
+	if (get_loop(L) != NULL) {
+		/*
+		 * Refuse before touching anything the running scheduler owns: its rx
+		 * userdata (cached as lp->rx), its channel registrations, its timer.
+		 */
+		printk("[%s] async: scheduler already running\n",
+		       k_thread_name_get(k_current_get()));
+		lua_settop(L, fn_idx - 1);
+		return -EALREADY;
+	}
 #if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
 	timing_init();
 	timing_start();
@@ -1827,14 +1835,10 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	zbus_iterate_over_channels_with_user_data(unwatch_now, (void *)sub);
 	(void)zbus_obs_set_enable(sub, true);
 
-	/* The idle timer is static, so a faulting run cannot leave it dangling. A nested
-	 * call (refused by l_run) must not touch the running scheduler's timer.
-	 */
-	if (outer == NULL) {
-		k_timer_init(ctx->timer, timer_expired, NULL);
-		k_timer_user_data_set(ctx->timer, ctx->tick);
-		k_poll_signal_init(ctx->tick);
-	}
+	/* The idle timer is static, so a faulting run cannot leave it dangling. */
+	k_timer_init(ctx->timer, timer_expired, NULL);
+	k_timer_user_data_set(ctx->timer, ctx->tick);
+	k_poll_signal_init(ctx->tick);
 
 	lua_pushcfunction(L, l_run);
 	lua_insert(L, fn_idx); /* l_run, f1 ... fn: the call consumes the functions */
@@ -1845,7 +1849,7 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 		/* l_run did not get to unwatch its channels or retire every task. */
 		(void)zbus_obs_set_enable(sub, false);
 		zbus_iterate_over_channels_with_user_data(unwatch_now, (void *)sub);
-		if (lp != NULL && lp != outer) {
+		if (lp != NULL) {
 			for (int s = 0; s < MAX_TASKS; s++) {
 				free_readers(lp, &lp->tasks[s]);
 			}
@@ -1863,15 +1867,12 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	/* Leave the subscriber clean for the next run, even after a fault. */
 	while (zbus_sub_wait_msg(sub, &chan, c->buf, K_NO_WAIT) == 0) {
 	}
-	if (outer == NULL) {
-		k_timer_stop(ctx->timer);
-	}
+	k_timer_stop(ctx->timer);
 	lua_pushnil(L);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &rx_key);
 
 	lua_settop(L, fn_idx - 1);
-	__ASSERT(outer != NULL || k_mem_slab_num_used_get(ctx->readers) == 0,
-		 "async: readers left in the slab");
+	__ASSERT(k_mem_slab_num_used_get(ctx->readers) == 0, "async: readers left in the slab");
 
 	return ret;
 }

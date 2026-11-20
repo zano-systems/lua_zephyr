@@ -109,8 +109,9 @@ struct luaz_async_ctx {
  * @param L    Main Lua state of the thread. The functions are popped.
  * @param ctx  Context from LUAZ_ASYNC_DEFINE (static storage).
  * @param n    Number of functions, 1..CONFIG_LUA_ASYNC_MAX_TASKS.
- * @return 0, -ENOMEM (no Lua stack space), -EBUSY (a channel stayed claimed;
- *         its registration is left disabled) or -EFAULT (scheduler fault).
+ * @return 0, -ENOMEM (no Lua stack space), -EALREADY (a scheduler already runs
+ *         on this Lua state; nothing was changed), -EBUSY (a channel stayed
+ *         claimed; its registration is left disabled) or -EFAULT (scheduler fault).
  */
 int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n);
 

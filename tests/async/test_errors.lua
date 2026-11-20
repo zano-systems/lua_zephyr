@@ -95,4 +95,23 @@ return {
 		end)
 		T.ok(closed)
 	end },
+
+	{ "a nested run is refused without disturbing the running one", function(T)
+		local async, F = T.start()
+		local nested, got
+		local ok = async._run(function()
+			local ch = F.channel("a")
+			async.spawn(function() got = ch:await(200) end)
+			async.yield() -- the awaiter registers on the channel and parks
+			nested = async._run(function() end)
+			collectgarbage()
+			collectgarbage()
+			F.publish("a", { v = "still here" })
+		end)
+		T.ok(ok, "outer run completes")
+		T.eq(nested, false, "nested run refused")
+		T.eq(got and got.v, "still here", "outer run still receives")
+		T.eq(#F.reports, 1)
+		T.matches(F.reports[1], "^async: scheduler already running")
+	end },
 }
