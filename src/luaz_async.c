@@ -297,6 +297,28 @@ static const struct zbus_channel *to_chan(lua_State *L, int idx)
 	return ok ? *ud : NULL;
 }
 
+/*
+ * Wrap-safe 32-bit arithmetic on sequence numbers and millisecond deadlines.
+ * The unsigned result is held in a temporary before the signed conversion, so
+ * no composite unsigned expression is converted to a signed type (MISRA C:2025
+ * Rule 10.8). Values above INT32_MAX convert modulo 2^32: implementation-defined
+ * in C11 6.3.1.3, and what GCC and Clang do. Comparisons through wrap_diff()
+ * hold while the two values are less than 2^31 apart.
+ */
+static inline int32_t wrap_diff(uint32_t a, uint32_t b)
+{
+	uint32_t d = a - b;
+
+	return (int32_t)d;
+}
+
+static inline int32_t wrap_add(int32_t a, uint32_t b)
+{
+	uint32_t sum = (uint32_t)a + b;
+
+	return (int32_t)sum;
+}
+
 static int32_t uptime(void)
 {
 	return (int32_t)(uint32_t)k_uptime_get();
@@ -397,13 +419,13 @@ static void runq_remove(struct loop *lp, int slot)
 /* Deadlines wrap at 32 bits: compare differences. */
 static bool before(const struct task *a, const struct task *b)
 {
-	int32_t d = (int32_t)((uint32_t)a->deadline - (uint32_t)b->deadline);
+	int32_t d = wrap_diff((uint32_t)a->deadline, (uint32_t)b->deadline);
 
 	if (d != 0) {
 		return d < 0;
 	}
 
-	return (int32_t)(a->park_seq - b->park_seq) < 0;
+	return wrap_diff(a->park_seq, b->park_seq) < 0;
 }
 
 static void timed_remove(struct loop *lp, int slot)
@@ -427,7 +449,7 @@ static void park(lua_State *L, struct loop *lp, int slot, int32_t ms)
 	if (ms >= 0) {
 		int i = lp->ntimed;
 
-		t->deadline = (int32_t)((uint32_t)uptime() + (uint32_t)ms);
+		t->deadline = wrap_add(uptime(), (uint32_t)ms);
 		while (i > 0 && before(t, &lp->tasks[lp->timed[i - 1]])) {
 			lp->timed[i] = lp->timed[i - 1];
 			i--;
@@ -480,7 +502,7 @@ static int parked_on(struct loop *lp, uint8_t st, int target, int16_t out[MAX_TA
 			continue;
 		}
 		i = n++;
-		while (i > 0 && (int32_t)(lp->tasks[out[i - 1]].park_seq - t->park_seq) > 0) {
+		while (i > 0 && wrap_diff(lp->tasks[out[i - 1]].park_seq, t->park_seq) > 0) {
 			out[i] = out[i - 1];
 			i--;
 		}
@@ -851,7 +873,7 @@ static void ring_trim(struct chan *ch)
 {
 	uint32_t min = ch->head - (uint32_t)ch->depth + 1;
 
-	if ((int32_t)(min - ch->low) > 0) {
+	if (wrap_diff(min, ch->low) > 0) {
 		ch->low = min;
 	}
 }
@@ -862,11 +884,11 @@ static void ring_resize(lua_State *L, struct chan *ch, lua_Integer depth)
 	uint8_t *ring = ring_new(L, ch->stride, depth);
 	uint32_t from = ch->head - (uint32_t)depth + 1;
 
-	if ((int32_t)(from - ch->low) < 0) {
+	if (wrap_diff(from, ch->low) < 0) {
 		from = ch->low;
 	}
 	/* The newest message goes to the last slot of the new ring. */
-	for (uint32_t seq = from; (int32_t)(ch->head - seq) >= 0; seq++) {
+	for (uint32_t seq = from; wrap_diff(ch->head, seq) >= 0; seq++) {
 		uint32_t slot = (uint32_t)depth - 1U - (ch->head - seq);
 
 		memcpy(&ring[(size_t)slot * ch->stride], ring_slot(ch, seq), ch->stride);
@@ -934,7 +956,7 @@ static void expire(lua_State *L, struct loop *lp)
 		int slot = lp->timed[0];
 		struct task *t = &lp->tasks[slot];
 
-		if ((int32_t)((uint32_t)t->deadline - (uint32_t)now) > 0) {
+		if (wrap_diff((uint32_t)t->deadline, (uint32_t)now) > 0) {
 			break;
 		}
 		timed_remove(lp, slot);
@@ -993,10 +1015,10 @@ static bool timer_due(struct loop *lp)
 		return false; /* an armed timer just causes one spurious pass */
 	}
 	deadline = lp->tasks[lp->timed[0]].deadline;
-	if (lp->timer_armed && (int32_t)((uint32_t)deadline - (uint32_t)lp->timer_deadline) >= 0) {
+	if (lp->timer_armed && wrap_diff((uint32_t)deadline, (uint32_t)lp->timer_deadline) >= 0) {
 		return false;
 	}
-	left = (int32_t)((uint32_t)deadline - (uint32_t)uptime());
+	left = wrap_diff((uint32_t)deadline, (uint32_t)uptime());
 	if (left <= 0) {
 		return true;
 	}
@@ -1416,7 +1438,7 @@ static void push_deadline(lua_State *L, int32_t ms)
 	if (ms < 0) {
 		lua_pushnil(L);
 	} else {
-		lua_pushinteger(L, (lua_Integer)(int32_t)((uint32_t)uptime() + (uint32_t)ms));
+		lua_pushinteger(L, (lua_Integer)wrap_add(uptime(), (uint32_t)ms));
 	}
 }
 
@@ -1428,7 +1450,7 @@ static int32_t time_left(lua_State *L, int idx)
 	if (lua_isnil(L, idx)) {
 		return -1;
 	}
-	left = (int32_t)((uint32_t)lua_tointeger(L, idx) - (uint32_t)uptime());
+	left = wrap_diff((uint32_t)lua_tointeger(L, idx), (uint32_t)uptime());
 
 	return left > 0 ? left : 0;
 }
@@ -1506,10 +1528,10 @@ static int await_try(lua_State *L, struct loop *lp, const struct zbus_channel *c
 	}
 
 	for (bool drained = false;; drained = true) {
-		if ((int32_t)(ch->head - rd->cursor) > 0) {
+		if (wrap_diff(ch->head, rd->cursor) > 0) {
 			uint32_t nxt = rd->cursor + 1;
 
-			if ((int32_t)(ch->low - nxt) > 0) { /* overwritten while away */
+			if (wrap_diff(ch->low, nxt) > 0) { /* overwritten while away */
 				rd->drops += ch->low - nxt;
 				nxt = ch->low;
 			}
@@ -1602,7 +1624,7 @@ static int l_dropped(lua_State *L)
 	rd = c >= 0 ? find_reader(&lp->tasks[slot], c) : NULL;
 	if (rd != NULL) {
 		/* Overwritten but not yet skipped; the next await counts it once. */
-		int32_t gap = (int32_t)(lp->chans[c].low - (rd->cursor + 1));
+		int32_t gap = wrap_diff(lp->chans[c].low, rd->cursor + 1U);
 
 		n = rd->drops;
 		if (gap > 0) {
