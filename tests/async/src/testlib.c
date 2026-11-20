@@ -161,6 +161,30 @@ static int l_hold(lua_State *L)
 	return 0;
 }
 
+/*
+ * testlib.publish_later(name, ms): the system workqueue publishes {v = "later"}
+ * on the channel after ms, waking a scheduler whose tasks are all parked.
+ */
+static const struct zbus_channel *later_chan;
+
+static void publish_later_work(struct k_work *work)
+{
+	struct t_msg msg = {.v = "later", .i = 0};
+
+	ARG_UNUSED(work);
+	(void)zbus_chan_pub(later_chan, &msg, K_MSEC(100));
+}
+
+static K_WORK_DELAYABLE_DEFINE(later_w, publish_later_work);
+
+static int l_publish_later(lua_State *L)
+{
+	later_chan = check_chan(L);
+	(void)k_work_schedule(&later_w, K_MSEC(luaL_checkinteger(L, 2)));
+
+	return 0;
+}
+
 /* testlib.watching(name) -> whether the suite's subscriber is on the channel */
 static int l_watching(lua_State *L)
 {
@@ -358,6 +382,7 @@ static int luaopen_testlib(lua_State *L)
 		{"watching", l_watching},
 		{"queued", l_queued},
 		{"timer_links", l_timer_links},
+		{"publish_later", l_publish_later},
 		{"alloc_check", l_alloc_check},
 		{NULL, NULL},
 	};

@@ -156,28 +156,37 @@ return {
 
 	{ "an earlier deadline arriving while the idle timer is armed wakes first", function(T)
 		local async, F = T.start()
-		local log = {}
+		local woke, at = {}, nil
 		async._run(function()
-			async.spawn(function() async.sleep(50); log[#log + 1] = { "long", F.now } end)
-			async.yield() -- the idle timer is armed for 50 ms
-			async.spawn(function() async.sleep(10); log[#log + 1] = { "short", F.now } end)
+			local ch = F.channel("a")
+			async.spawn(function() async.sleep(50); woke.long = F.now end)
+			F.publish_later("a", 5)
+			-- Every task is parked now, so the idle timer is armed for 50 ms; only
+			-- the message from the workqueue wakes this task, at 5 ms.
+			ch:await()
+			at = F.now
+			async.spawn(function() async.sleep(10); woke.short = F.now end)
 		end)
-		T.eq(log[1][1], "short")
-		T.ok(log[1][2] >= 10, "short did not wake early")
-		T.eq(log[2][1], "long")
-		T.ok(log[2][2] >= 50, "long did not wake early")
+		T.ok(at >= 5 and at <= 6, "controller woke at the message (" .. tostring(at) .. ")")
+		T.ok(woke.short >= at + 10 and woke.short <= at + 11,
+			"the earlier deadline re-armed the timer (woke at " .. tostring(woke.short) .. ")")
+		T.eq(woke.long, 50, "the later deadline is unchanged")
 	end },
 
-	{ "cancelling the earliest sleeper wakes no one early", function(T)
+	{ "cancelling the earliest sleeper while the idle timer is armed wakes no one early", function(T)
 		local async, F = T.start()
-		local woke
+		local woke_early, woke_late, cancelled
 		async._run(function()
-			local early = async.spawn(function() async.sleep(10) end)
-			async.spawn(function() async.sleep(30); woke = F.now end)
-			async.yield() -- the idle timer is armed for 10 ms
-			early:cancel()
+			local ch = F.channel("a")
+			local early = async.spawn(function() async.sleep(10); woke_early = F.now end)
+			async.spawn(function() async.sleep(30); woke_late = F.now end)
+			F.publish_later("a", 2)
+			ch:await() -- all parked: the idle timer is armed for 10 ms
+			cancelled = early:cancel()
 		end)
-		T.ok(woke ~= nil and woke >= 30, "late sleeper woke at its own deadline")
+		T.eq(cancelled, true)
+		T.eq(woke_early, nil, "cancelled sleeper never woke")
+		T.eq(woke_late, 30, "late sleeper woke at its own deadline")
 	end },
 
 	{ "equal deadlines wake together, in park order", function(T)

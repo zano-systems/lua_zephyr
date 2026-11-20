@@ -123,6 +123,7 @@ function T.start(needs)
 		claim = function(name) return lib.claim("t_" .. name) end,
 		finish = function(name) return lib.finish("t_" .. name) end,
 		hold = function(name, ms) lib.hold("t_" .. name, ms) end,
+		publish_later = function(name, ms) lib.publish_later("t_" .. name, ms) end,
 		timer_links = lib.timer_links,
 		alloc_check = lib.alloc_check,
 	}, {
