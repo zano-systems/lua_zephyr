@@ -43,6 +43,8 @@ function zbus_channel:pub_async(data, timeout) end
 function zbus_channel:read_async(timeout) end
 
 --- Get or set how many recent messages are kept for await (CONFIG_LUA_ASYNC).
+--- The ring reserves all `depth` slots at once, so a depth too large for the
+--- thread's heap raises here instead of later, as messages arrive.
 ---@param depth? integer # New depth, >= 1.
 ---@return integer depth
 function zbus_channel:queue_depth(depth) end

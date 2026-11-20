@@ -442,8 +442,10 @@ From the thread's Lua heap, on 32-bit targets:
 - Each task: about 0.5 KB (548 B for one `spawn` on `native_sim`), almost all
   of it the Lua coroutine (its state and initial stack). A finished task's
   coroutine is freed at the next garbage collection.
-- Each awaited channel: up to `queue_depth` raw messages, plus one decoded
-  table per reader.
+- Each awaited channel: a ring of `queue_depth` message slots, reserved when
+  the channel is first awaited or resized (each slot is the message size
+  rounded up to `max_align_t`), plus one decoded table per reader. A depth
+  too large for the heap makes `chan:queue_depth(n)` raise right away.
 - Each file of a multi-file thread: its loaded chunk (378 B for a small file on
   `native_sim`). On mps2/an385, `samples/async_files` (16 tasks) peaks at
   26468 B from source and 23900 B as bytecode, of a 32768 B heap.
