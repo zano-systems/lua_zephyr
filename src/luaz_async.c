@@ -1444,26 +1444,27 @@ static int park_on_lock(lua_State *L, const struct zbus_channel *chan, int32_t l
 	return lua_yieldk(L, 0, ctx, k);
 }
 
-static int await_try(lua_State *L);
+static int await_try(lua_State *L, struct loop *lp, const struct zbus_channel *chan);
 
+/* Continuation after a lock wait; ctx carries the channel l_await resolved. */
 static int await_k(lua_State *L, int status, lua_KContext ctx)
 {
 	ARG_UNUSED(status);
-	ARG_UNUSED(ctx);
 
 	if (lua_gettop(L) > 2) { /* expire() replied nil, -EAGAIN */
 		return 2;
 	}
 
-	return await_try(L);
+	return await_try(L, up_loop(L), (const struct zbus_channel *)(intptr_t)ctx);
 }
 
-/* One attempt of await; the stack is 1 chan, 2 deadline or nil (forever). */
-static int await_try(lua_State *L)
+/*
+ * One attempt of await; the stack is 1 chan, 2 deadline or nil (forever).
+ * chan is stack slot 1 already resolved, so it is not checked again.
+ */
+static int await_try(lua_State *L, struct loop *lp, const struct zbus_channel *chan)
 {
-	struct loop *lp = up_loop(L);
 	int slot = cur_slot(L, lp);
-	const struct zbus_channel *chan = to_chan(L, 1);
 	int32_t left = time_left(L, 2);
 	struct luaz_async_reader *rd;
 	struct chan *ch;
@@ -1484,7 +1485,7 @@ static int await_try(lua_State *L)
 				lua_pushinteger(L, -EAGAIN);
 				return 2;
 			}
-			return park_on_lock(L, chan, left, 0, await_k);
+			return park_on_lock(L, chan, left, (lua_KContext)(intptr_t)chan, await_k);
 		}
 		/* -EALREADY: left registered by an earlier run. */
 		if (rc != 0 && rc != -EALREADY) {
@@ -1534,8 +1535,9 @@ static int l_await(lua_State *L)
 {
 	int32_t ms = check_timeout(L, 2, "await", true);
 	const struct zbus_channel *chan = to_chan(L, 1);
+	struct loop *lp = up_loop(L);
 
-	(void)cur_slot(L, up_loop(L));
+	(void)cur_slot(L, lp);
 	if (chan == NULL) {
 		return luaL_typeerror(L, 1, "zbus channel");
 	}
@@ -1546,7 +1548,7 @@ static int l_await(lua_State *L)
 	lua_settop(L, 1);
 	push_deadline(L, ms);
 
-	return await_try(L);
+	return await_try(L, lp, chan);
 }
 
 static int l_queue_depth(lua_State *L)
