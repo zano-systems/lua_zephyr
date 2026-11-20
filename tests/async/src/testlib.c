@@ -10,6 +10,7 @@
 
 #include <luaz_async.h>
 #include <luaz_msg_descr.h>
+#include <luaz_utils.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk-hooks.h>
@@ -226,6 +227,56 @@ static int l_timer_links(lua_State *L)
 	return 1;
 }
 
+/*
+ * testlib.alloc_check() -> "ok" or what failed. Drives the state's allocator
+ * directly, so no Lua allocation interleaves with the counters it checks.
+ */
+static int l_alloc_check(lua_State *L)
+{
+#ifdef CONFIG_LUA_ALLOC_STATS
+	void *ud;
+	lua_Alloc f = lua_getallocf(L, &ud);
+	struct luaz_alloc_stats a;
+	struct luaz_alloc_stats b;
+	void *p;
+
+	luaz_alloc_stats_reset();
+	luaz_alloc_stats_get(&a);
+	if (a.live == 0U || a.peak != a.live || a.allocs != 0U || a.bytes != 0U) {
+		lua_pushliteral(L, "reset must keep live bytes and set peak to them");
+		return 1;
+	}
+	if (f(ud, NULL, LUA_TSTRING, SIZE_MAX / 2U) != NULL) {
+		lua_pushliteral(L, "huge allocation succeeded");
+		return 1;
+	}
+	luaz_alloc_stats_get(&b);
+	if (b.fails != a.fails + 1U || b.allocs != a.allocs || b.bytes != a.bytes ||
+	    b.live != a.live || b.peak != a.peak) {
+		lua_pushliteral(L, "a failed allocation must only count as a failure");
+		return 1;
+	}
+	p = f(ud, NULL, LUA_TSTRING, 64U);
+	luaz_alloc_stats_get(&b);
+	if (p == NULL || b.allocs != 1U || b.bytes != 64U || b.live != a.live + 64U ||
+	    b.peak != a.live + 64U) {
+		lua_pushliteral(L, "an allocation must count bytes, live and peak");
+		return 1;
+	}
+	(void)f(ud, p, 64U, 0U);
+	luaz_alloc_stats_get(&b);
+	if (b.frees != 1U || b.live != a.live || b.peak != a.live + 64U) {
+		lua_pushliteral(L, "a free must lower live bytes and keep the peak");
+		return 1;
+	}
+	lua_pushliteral(L, "ok");
+#else
+	lua_pushnil(L);
+#endif
+
+	return 1;
+}
+
 /* Returns what printk wrote since the last call, and clears it. */
 static int l_captured(lua_State *L)
 {
@@ -256,6 +307,10 @@ static int l_config(lua_State *L)
 	lua_setfield(L, -2, "node_pool");
 	lua_pushinteger(L, IS_ENABLED(CONFIG_OBJ_CORE_TIMER) ? 1 : 0);
 	lua_setfield(L, -2, "obj_core");
+	lua_pushinteger(L, IS_ENABLED(CONFIG_LUA_ASYNC_STATS) && IS_ENABLED(CONFIG_LUA_ALLOC_STATS)
+				   ? 1
+				   : 0);
+	lua_setfield(L, -2, "stats");
 
 	return 1;
 }
@@ -303,6 +358,7 @@ static int luaopen_testlib(lua_State *L)
 		{"watching", l_watching},
 		{"queued", l_queued},
 		{"timer_links", l_timer_links},
+		{"alloc_check", l_alloc_check},
 		{NULL, NULL},
 	};
 

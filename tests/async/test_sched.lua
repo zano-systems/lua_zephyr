@@ -153,4 +153,41 @@ return {
 		end
 		T.eq(F.timer_links(), 1, "registrations of the idle timer")
 	end },
+
+	{ "an earlier deadline arriving while the idle timer is armed wakes first", function(T)
+		local async, F = T.start()
+		local log = {}
+		async._run(function()
+			async.spawn(function() async.sleep(50); log[#log + 1] = { "long", F.now } end)
+			async.yield() -- the idle timer is armed for 50 ms
+			async.spawn(function() async.sleep(10); log[#log + 1] = { "short", F.now } end)
+		end)
+		T.eq(log[1][1], "short")
+		T.ok(log[1][2] >= 10, "short did not wake early")
+		T.eq(log[2][1], "long")
+		T.ok(log[2][2] >= 50, "long did not wake early")
+	end },
+
+	{ "cancelling the earliest sleeper wakes no one early", function(T)
+		local async, F = T.start()
+		local woke
+		async._run(function()
+			local early = async.spawn(function() async.sleep(10) end)
+			async.spawn(function() async.sleep(30); woke = F.now end)
+			async.yield() -- the idle timer is armed for 10 ms
+			early:cancel()
+		end)
+		T.ok(woke ~= nil and woke >= 30, "late sleeper woke at its own deadline")
+	end },
+
+	{ "equal deadlines wake together, in park order", function(T)
+		local async, F = T.start()
+		local log = {}
+		async._run(function()
+			for _, name in ipairs({ "a", "b", "c" }) do
+				async.spawn(function() async.sleep(10); log[#log + 1] = name .. "@" .. F.now end)
+			end
+		end)
+		T.same(log, { "a@10", "b@10", "c@10" })
+	end },
 }

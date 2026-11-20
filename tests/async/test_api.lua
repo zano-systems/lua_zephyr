@@ -163,4 +163,26 @@ return {
 		end)
 		T.same(seen, { "ready", "sleeping", "running", "done", "failed" })
 	end },
+
+	{ "async.stats() reports live totals during a run", function(T)
+		local async = T.start({ stats = 1 })
+		local s1, s2
+		async._run(function()
+			s1 = async.stats()
+			for _ = 1, 10 do
+				async.yield()
+			end
+			async.sleep(2)
+			s2 = async.stats()
+		end)
+		T.ok(s2.cyc_total > s1.cyc_total, "cyc_total grows during the run")
+		T.ok(s2.resumes >= s1.resumes + 11, "resumes counted")
+		T.ok(s2.passes > s1.passes, "passes counted")
+		T.ok(s2.idle_waits > s1.idle_waits, "idle wait counted")
+	end },
+
+	{ "allocator stats: reset, failure, alloc and free", function(T)
+		local _, F = T.start({ stats = 1 })
+		T.eq(F.alloc_check(), "ok")
+	end },
 }

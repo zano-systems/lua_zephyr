@@ -102,34 +102,6 @@ struct chan {
 	bool watched;
 };
 
-struct loop {
-	int current; /* -1 when no task runs */
-	int live;
-	uint32_t park_seq;
-	int rq_head;
-	int rq_len;
-	int pass_left; /* tasks of the current pass still queued, at the front */
-	int ntimed;
-	int nlocking;           /* tasks in T_LOCKING */
-	int32_t timer_deadline; /* when timer_armed: the deadline the idle timer fires at */
-	bool timer_armed;
-	bool draining;
-	struct k_mem_slab *readers;
-	struct rx *rx;
-#ifdef CONFIG_LUA_ASYNC_STATS
-	struct luaz_async_stats *stats;
-#endif
-	struct task tasks[MAX_TASKS];
-	struct chan chans[MAX_CHANS];
-	int16_t runq[MAX_TASKS];
-	int16_t timed[MAX_TASKS];
-};
-
-struct handle {
-	int slot;
-	uint8_t final;
-};
-
 /* Profiling counters (CONFIG_LUA_ASYNC_STATS); no code when disabled. */
 #ifdef CONFIG_LUA_ASYNC_STATS
 #ifdef CONFIG_TIMING_FUNCTIONS
@@ -178,6 +150,35 @@ static uint32_t stat_hz(void)
 #define STAT_CYC(_lp, _f, _v) ((void)(_lp))
 #endif
 #define STAT_INC(_lp, _f) STAT_ADD(_lp, _f, 1)
+
+struct loop {
+	int current; /* -1 when no task runs */
+	int live;
+	uint32_t park_seq;
+	int rq_head;
+	int rq_len;
+	int pass_left; /* tasks of the current pass still queued, at the front */
+	int ntimed;
+	int nlocking;           /* tasks in T_LOCKING */
+	int32_t timer_deadline; /* when timer_armed: the deadline the idle timer fires at */
+	bool timer_armed;
+	bool draining;
+	struct k_mem_slab *readers;
+	struct rx *rx;
+#ifdef CONFIG_LUA_ASYNC_STATS
+	struct luaz_async_stats *stats;
+	STAT_CLOCK run_t0; /* start of the run, for a live cyc_total */
+#endif
+	struct task tasks[MAX_TASKS];
+	struct chan chans[MAX_CHANS];
+	int16_t runq[MAX_TASKS];
+	int16_t timed[MAX_TASKS];
+};
+
+struct handle {
+	int slot;
+	uint8_t final;
+};
 
 /*
  * Per-state record the bindings carry as upvalue 1, so they reach the running
@@ -1162,11 +1163,13 @@ static int l_run(lua_State *L)
 
 	lua_pushcfunction(L, fault_handler);
 	lua_pushcfunction(L, loop_body);
-	{
-		STAT_T0(t_total);
-		st = lua_pcall(L, 0, 0, -2);
-		STAT_CYC(lp, cyc_total, t_total);
-	}
+#ifdef CONFIG_LUA_ASYNC_STATS
+	lp->run_t0 = stat_now();
+#endif
+	st = lua_pcall(L, 0, 0, -2);
+#ifdef CONFIG_LUA_ASYNC_STATS
+	lp->stats->cyc_total = stat_since(lp->run_t0);
+#endif
 	lp->current = -1;
 
 	if (st != LUA_OK) {
@@ -1697,6 +1700,8 @@ static int l_stats(lua_State *L)
 	const struct luaz_async_stats *st;
 
 	(void)cur_slot(L, lp);
+	/* The run is still going: report the time so far. */
+	lp->stats->cyc_total = stat_since(lp->run_t0);
 	st = lp->stats;
 
 	lua_createtable(L, 0, 14);
@@ -1837,6 +1842,7 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 		return -EALREADY;
 	}
 #if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
+	/* Reference-counted: paired with the timing_stop() before the return below. */
 	timing_init();
 	timing_start();
 #endif
@@ -1894,6 +1900,9 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 
 	lua_settop(L, fn_idx - 1);
 	__ASSERT(k_mem_slab_num_used_get(ctx->readers) == 0, "async: readers left in the slab");
+#if defined(CONFIG_LUA_ASYNC_STATS) && defined(CONFIG_TIMING_FUNCTIONS)
+	timing_stop();
+#endif
 
 	return ret;
 }

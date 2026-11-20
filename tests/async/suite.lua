@@ -12,7 +12,7 @@ local lib = require("testlib")
 local cfg = lib.config()
 local DEFAULTS = {
 	max_tasks = 8, max_chans = 8, depth = 4, max_drain = 16, node_pool = 0,
-	max_readers = 16, max_locks = 4, obj_core = 0,
+	max_readers = 16, max_locks = 4, obj_core = 0, stats = 0,
 }
 
 lib.run(function() end) -- installs the zephyr.async preload
@@ -124,6 +124,7 @@ function T.start(needs)
 		finish = function(name) return lib.finish("t_" .. name) end,
 		hold = function(name, ms) lib.hold("t_" .. name, ms) end,
 		timer_links = lib.timer_links,
+		alloc_check = lib.alloc_check,
 	}, {
 		__index = function(_, k)
 			if k == "now" then
