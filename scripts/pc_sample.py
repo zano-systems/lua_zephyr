@@ -11,6 +11,9 @@ loop, flash it, then:
 
 Self time is where the PC was; "via" names the caller from LR, which is
 exact for leaf functions and a hint otherwise.
+
+Needs pylink (tested with 1.7.0) and pyelftools. Sampling uses pylink's
+private J-Link DLL handle, since JLink.halt() sleeps 1 s after each halt.
 """
 
 import argparse
@@ -22,6 +25,8 @@ import time
 
 import pylink
 from elftools.elf.elffile import ELFFile
+
+TESTED_PYLINK = "1.7.0"
 
 
 class Symbols:
@@ -43,6 +48,16 @@ class Symbols:
             return "?"
         start, size, name = self.funcs[i]
         return name if size == 0 or pc < start + size else "?"
+
+
+def raw_dll(jl):
+    """The J-Link DLL behind pylink, or exit with a clear message."""
+    dll = getattr(jl, "_dll", None)
+    if dll is None or not all(hasattr(dll, f) for f in ("JLINKARM_Halt", "JLINKARM_GoEx")):
+        sys.exit(f"pc_sample.py: pylink {getattr(pylink, '__version__', '?')} no longer "
+                 f"exposes the J-Link DLL as JLink._dll (tested with {TESTED_PYLINK}); "
+                 "install that version or update raw_dll().")
+    return dll
 
 
 def reg_index(jl, wanted):
@@ -70,15 +85,19 @@ def main():
     jl.set_tif(pylink.enums.JLinkInterfaces.SWD)
     jl.connect(args.device, speed=4000)
     pc_i, lr_i = reg_index(jl, "R15"), reg_index(jl, "R14")
+    dll = raw_dll(jl)
+    if getattr(pylink, "__version__", None) != TESTED_PYLINK:
+        print(f"note: tested with pylink {TESTED_PYLINK}, running {pylink.__version__}",
+              file=sys.stderr)
 
     self_t = collections.Counter()
     via = collections.defaultdict(collections.Counter)
     for _ in range(args.samples):
         time.sleep(random.uniform(0.0005, 0.003))
         # JLink.halt() sleeps 1 s after halting; call the DLL directly.
-        jl._dll.JLINKARM_Halt()
+        dll.JLINKARM_Halt()
         pc, lr = jl.register_read(pc_i), jl.register_read(lr_i)
-        jl._dll.JLINKARM_GoEx(0, 0)
+        dll.JLINKARM_GoEx(0, 0)
         fn = syms.name(pc)
         self_t[fn] += 1
         via[fn][syms.name(lr)] += 1
