@@ -8,6 +8,7 @@
 
 #include <luaz_msg_descr.h>
 #include <lauxlib.h>
+#include <limits.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 
@@ -26,8 +27,11 @@
 void lua_msg_descr_to_table(lua_State *L, const struct lua_msg_field_descr *fields,
 			    size_t field_count, const void *base)
 {
-	/* Presized: one hash allocation instead of a rehash at each power of two. */
-	lua_createtable(L, 0, (int)field_count);
+	/*
+	 * Presized: one hash allocation instead of a rehash at each power of two.
+	 * The size is only a hint, so clamping it to int cannot change behavior.
+	 */
+	lua_createtable(L, 0, (int)MIN(field_count, (size_t)INT_MAX));
 
 	for (size_t i = 0; i < field_count; i++) {
 		const struct lua_msg_field_descr *f = &fields[i];
