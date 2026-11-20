@@ -936,7 +936,7 @@ static void check_locks(lua_State *L, struct loop *lp)
 	}
 }
 
-static void timer_expired(struct k_timer *timer)
+void luaz_async_timer_expired(struct k_timer *timer)
 {
 	k_poll_signal_raise(k_timer_user_data_get(timer), 0);
 }
@@ -1835,10 +1835,10 @@ int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n)
 	zbus_iterate_over_channels_with_user_data(unwatch_now, (void *)sub);
 	(void)zbus_obs_set_enable(sub, true);
 
-	/* The idle timer is static, so a faulting run cannot leave it dangling. */
-	k_timer_init(ctx->timer, timer_expired, NULL);
+	/* The idle timer is initialized statically (LUAZ_ASYNC_DEFINE); only reset it. */
+	k_timer_stop(ctx->timer);
 	k_timer_user_data_set(ctx->timer, ctx->tick);
-	k_poll_signal_init(ctx->tick);
+	k_poll_signal_reset(ctx->tick);
 
 	lua_pushcfunction(L, l_run);
 	lua_insert(L, fn_idx); /* l_run, f1 ... fn: the call consumes the functions */

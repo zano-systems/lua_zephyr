@@ -91,8 +91,8 @@ struct luaz_async_ctx {
 	K_MEM_SLAB_DEFINE_STATIC(_name##_readers, sizeof(struct luaz_async_reader),                \
 				 LUAZ_ASYNC_READERS(_max_readers), sizeof(void *));                \
 	Z_LUAZ_ASYNC_STATS_DEFINE(_name);                                                          \
-	static struct k_timer _name##_timer;                                                       \
-	static struct k_poll_signal _name##_tick;                                                  \
+	K_TIMER_DEFINE(_name##_timer, luaz_async_timer_expired, NULL);                             \
+	static struct k_poll_signal _name##_tick = K_POLL_SIGNAL_INITIALIZER(_name##_tick);        \
 	static const struct luaz_async_ctx _name = {                                               \
 		.sub = &_name##_sub,                                                               \
 		.readers = &_name##_readers,                                                       \
@@ -114,6 +114,17 @@ struct luaz_async_ctx {
  *         claimed; its registration is left disabled) or -EFAULT (scheduler fault).
  */
 int luaz_async_run(lua_State *L, const struct luaz_async_ctx *ctx, int n);
+
+/**
+ * @brief Expiry handler of the idle timer that LUAZ_ASYNC_DEFINE defines.
+ *
+ * The timer and its signal are initialized statically, once: re-running
+ * k_timer_init() on a live timer would re-link it into the kernel's object
+ * lists (CONFIG_OBJ_CORE_TIMER).
+ *
+ * @param timer  The context's timer; its user data is the context's signal.
+ */
+void luaz_async_timer_expired(struct k_timer *timer);
 
 /**
  * @brief Warn once per call site when a blocking binding runs under the scheduler.

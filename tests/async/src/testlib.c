@@ -183,6 +183,49 @@ static int l_queued(lua_State *L)
 	return 1;
 }
 
+#ifdef CONFIG_OBJ_CORE_TIMER
+/* Stops a walk that would not end (a cycle from a re-linked timer). */
+#define WALK_BOUND 1000
+
+struct timer_count {
+	int seen;
+	int visits;
+};
+
+static int count_timer(struct k_obj_core *obj_core, void *data)
+{
+	struct timer_count *tc = data;
+
+	if (obj_core == K_OBJ_CORE(&suite_async_timer)) {
+		tc->seen++;
+	}
+	tc->visits++;
+
+	return tc->visits < WALK_BOUND ? 0 : -1;
+}
+#endif
+
+/* testlib.timer_links() -> times the suite's idle timer is registered, -1 for
+ * an unbounded walk, or nil without CONFIG_OBJ_CORE_TIMER
+ */
+static int l_timer_links(lua_State *L)
+{
+#ifdef CONFIG_OBJ_CORE_TIMER
+	struct k_obj_type *type = k_obj_type_find(K_OBJ_TYPE_TIMER_ID);
+	struct timer_count tc = {0};
+
+	if (type == NULL) {
+		return luaL_error(L, "no timer object type");
+	}
+	(void)k_obj_type_walk_unlocked(type, count_timer, &tc);
+	lua_pushinteger(L, tc.visits >= WALK_BOUND ? -1 : tc.seen);
+#else
+	lua_pushnil(L);
+#endif
+
+	return 1;
+}
+
 /* Returns what printk wrote since the last call, and clears it. */
 static int l_captured(lua_State *L)
 {
@@ -211,6 +254,8 @@ static int l_config(lua_State *L)
 	lua_pushinteger(L, COND_CODE_1(CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_ALLOC_STATIC,
 				       (CONFIG_ZBUS_RUNTIME_OBSERVERS_NODE_POOL_SIZE), (0)));
 	lua_setfield(L, -2, "node_pool");
+	lua_pushinteger(L, IS_ENABLED(CONFIG_OBJ_CORE_TIMER) ? 1 : 0);
+	lua_setfield(L, -2, "obj_core");
 
 	return 1;
 }
@@ -257,6 +302,7 @@ static int luaopen_testlib(lua_State *L)
 		{"readers", l_readers},
 		{"watching", l_watching},
 		{"queued", l_queued},
+		{"timer_links", l_timer_links},
 		{NULL, NULL},
 	};
 

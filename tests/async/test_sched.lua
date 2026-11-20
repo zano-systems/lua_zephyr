@@ -145,4 +145,12 @@ return {
 		end)
 		T.matches(err, "task limit reached")
 	end },
+
+	{ "the idle timer is registered once across runs", function(T)
+		local async, F = T.start({ obj_core = 1 })
+		for _ = 1, 5 do
+			async._run(function() async.sleep(2) end)
+		end
+		T.eq(F.timer_links(), 1, "registrations of the idle timer")
+	end },
 }
