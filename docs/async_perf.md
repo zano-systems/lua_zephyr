@@ -40,6 +40,10 @@ instrumentation added and disabled.
 | read_async | 17267 | 9840 | −43% | 5.02 → 3.01 |
 | spawn_join | 23825 | 25286 | +6% | 7.05 → 7.04 |
 
+pub_async, read_async and spawn_join now check every result inside the
+measured loop (see Review fixes), so their "now" numbers include that work
+and do not compare directly with the baseline.
+
 Incremental GC. Generational GC gives the same cycle counts within a few
 percent.
 
